@@ -1,0 +1,50 @@
+{
+  "saved_at": "2025-08-15T14:30:00.000000Z",
+  "symbol": "SOL/USDT",
+  "timeframe": "15m",
+  "horizon": 24,
+  "smooth_span": 10,
+  "turnover_cap": 0.05,
+  "quantiles": {
+    "enter_long_q": 0.85,
+    "exit_long_q": 0.60,
+    "enter_short_q": 0.15,
+    "exit_short_q": 0.35
+  },
+  "thresholds": {
+    "enter_long": 0.58,
+    "exit_long": 0.51,
+    "enter_short": 0.35,
+    "exit_short": 0.42
+  },
+  "min_hold": 24,
+  "cooldown": 24,
+  "fees": {
+    "fee_per_side": 0.0002,
+    "slippage_per_side": 0.0002
+  },
+  "performance": {
+    "sharpe": 1.2,
+    "cagr": 0.45,
+    "max_dd": -0.25,
+    "combined_score": 0.9
+  },
+  "turnover_cap_violated": false,
+  "dynamic_features": {
+    "use_dynamic_sizing": true,
+    "max_position_size": 0.8,
+    "dd_protection_threshold": -0.15,
+    "volatility_filter": true,
+    "kelly_criterion": true,
+    "adaptive_min_hold": true
+  },
+  "risk_management": {
+    "max_consecutive_losses": 3,
+    "volatility_adjustment": true,
+    "confidence_scaling": true,
+    "protection_active_pct": 5.2
+  }
+}
+
+
+

@@ -1,0 +1,36 @@
+{
+  "saved_at": "2025-08-15T14:17:32.127975+00:00",
+  "symbol": "SOL/USDT",
+  "timeframe": "15m",
+  "horizon": 24,
+  "smooth_span": 12,
+  "turnover_cap": 0.05,
+  "max_dd_cap": 0.3,
+  "calibration": "none",
+  "search": "dynamic",
+  "bayes_calls": null,
+  "quantiles": {
+    "enter_long_q": 0.88,
+    "exit_long_q": 0.6,
+    "enter_short_q": 0.12,
+    "exit_short_q": 0.45
+  },
+  "thresholds": {
+    "enter_long": 0.5093852819106031,
+    "exit_long": 0.5010065251052827,
+    "enter_short": 0.49292958936093695,
+    "exit_short": 0.49962639829085576
+  },
+  "min_hold": 24,
+  "cooldown": 12,
+  "fees": {
+    "fee_per_side": 0.0003,
+    "slippage_per_side": 0.0001
+  },
+  "performance": {
+    "sharpe": 1.4591171243831524,
+    "cagr": 0.3588212700471851,
+    "max_dd": -0.22040253743093574
+  },
+  "turnover_cap_violated": false
+}
