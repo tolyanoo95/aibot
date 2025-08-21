@@ -35,7 +35,7 @@ pd.set_option("display.width", 180)
 pd.set_option("display.max_columns", 60)
 
 # ----------------------------- Defaults -----------------------------
-DEFAULT_SYMBOL = "XRP/USDT"
+DEFAULT_SYMBOL = "SOL/USDT"
 DEFAULT_TIMEFRAME = "15m"
 DEFAULT_MAX_BARS = 60000           # ~2-3 года на 15m
 DEFAULT_HORIZON_BARS = 24           # горизонт цели (≈ 6ч для 15m)
