@@ -30,12 +30,12 @@ pd.set_option("display.max_columns", 60)
 DEFAULT_SYMBOL = "SOL/USDT"
 DEFAULT_TIMEFRAME = "15m"
 DEFAULT_MAX_BARS = 60000           # ~2-3 года на 15m
-DEFAULT_HORIZON_BARS = 24            # горизонт цели (≈ 6ч для 15m)
-DEFAULT_SMOOTH_SPAN = 12             # EMA сглаживание вероятностей
+DEFAULT_HORIZON_BARS = 24 #48            # горизонт цели (≈ 6ч для 15m)
+DEFAULT_SMOOTH_SPAN = 12 #36            # EMA сглаживание вероятностей
 FEE_PER_SIDE = 0.0003                # комиссия на сторону (0.03%)
 SLIPPAGE_PER_SIDE = 0.0001           # проскальзывание на сторону (0.01%)
 RANDOM_STATE = 42
-DEFAULT_TURNOVER_CAP = 0.05          # макс. поворотов на бар
+DEFAULT_TURNOVER_CAP = 0.05 #0.02         # макс. поворотов на бар
 DEFAULT_MAX_DD_CAP = 0.40            # макс. просадка для отбора порогов
 DEFAULT_LAST_DAYS = 0                # окно "последние N дней", 0=выключено
 
