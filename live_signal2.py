@@ -265,17 +265,28 @@ class LiveTrader:
         
         # --- Stop-Loss: приоритет [CLI флаг -> JSON -> дефолт] ---
         sl_settings = th_all.get("stop_loss", {})
-        self.use_stop_loss = self.config.get("use_stop_loss", sl_settings.get("use", False))
-        # Сначала пытаемся взять multiplier из CLI, если он был передан
+        # Сначала читаем из JSON, это база
+        self.use_stop_loss = sl_settings.get("use", False)
+        # Если в CLI был передан флаг --disable-stop-loss, он станет False. Если нет - останется True из set_defaults
+        # Этот флаг должен переопределить значение из JSON.
+        if self.config["use_stop_loss"] is not None and self.config["use_stop_loss"] != sl_settings.get("use"):
+             self.use_stop_loss = self.config["use_stop_loss"]
+
+        # Аналогично для multiplier: CLI имеет приоритет
         cli_sl_mult = self.config.get("sl_atr_multiplier")
         if cli_sl_mult is not None:
             self.sl_atr_multiplier = cli_sl_mult
-        else: # Иначе - из JSON файла, и если нет - дефолт
+        else:
             self.sl_atr_multiplier = sl_settings.get("atr_multiplier", 2.5)
         
         # --- HTF Filter: приоритет [CLI флаг -> JSON -> дефолт] ---
         htf_settings = th_all.get("htf_filter", {})
-        self.use_htf_filter = self.config.get("use_htf_filter", htf_settings.get("use", False))
+        # Сначала читаем из JSON
+        self.use_htf_filter = htf_settings.get("use", False)
+        # Затем смотрим, не переопределил ли его флаг CLI
+        if self.config["use_htf_filter"] is not None and self.config["use_htf_filter"] != htf_settings.get("use"):
+            self.use_htf_filter = self.config["use_htf_filter"]
+
         self.htf_timeframe = self.config.get("htf_timeframe") or htf_settings.get("timeframe", "4h")
         self.htf_supertrend_period = self.config.get("htf_supertrend_period") or htf_settings.get("supertrend_period", 14)
         self.htf_supertrend_multiplier = self.config.get("htf_supertrend_multiplier") or htf_settings.get("supertrend_multiplier", 2.5)
@@ -464,16 +475,18 @@ def main():
     ap.add_argument("--symbol", type=str, default="SOL/USDT", help="Symbol to trade")
     ap.add_argument("--timeframe", type=str, default="15m", help="Trading timeframe")
     
-    # By default, filters are ON. Use flags to disable them.
+    # By default, filters are ON if no flag is specified. Use flags to disable them.
     ap.add_argument("--disable-htf-filter", dest="use_htf_filter", action="store_false", help="Отключить фильтр по старшему ТФ (Supertrend)")
-    ap.set_defaults(use_htf_filter=True)
-    ap.add_argument("--htf-timeframe", type=str, default="4h", help="Старший ТФ для фильтра")
-    ap.add_argument("--htf-supertrend-period", type=int, default=14, help="Период ATR для Supertrend-фильтра HTF")
-    ap.add_argument("--htf-supertrend-multiplier", type=float, default=2.5, help="Множитель ATR для Supertrend-фильтра HTF")
+    ap.add_argument("--enable-htf-filter", dest="use_htf_filter", action="store_true", help="Принудительно включить фильтр по старшему ТФ")
+    ap.set_defaults(use_htf_filter=None) # Убираем дефолт, чтобы различать "не указано" и "указано"
+    ap.add_argument("--htf-timeframe", type=str, default=None, help="Старший ТФ для фильтра")
+    ap.add_argument("--htf-supertrend-period", type=int, default=None, help="Период ATR для Supertrend-фильтра HTF")
+    ap.add_argument("--htf-supertrend-multiplier", type=float, default=None, help="Множитель ATR для Supertrend-фильтра HTF")
     
     # Stop-Loss
     ap.add_argument("--disable-stop-loss", dest="use_stop_loss", action="store_false", help="Отключить динамический стоп-лосс по ATR")
-    ap.set_defaults(use_stop_loss=True)
+    ap.add_argument("--enable-stop-loss", dest="use_stop_loss", action="store_true", help="Принудительно включить стоп-лосс")
+    ap.set_defaults(use_stop_loss=None) # Убираем дефолт
     ap.add_argument("--sl-atr-multiplier", type=float, default=None, help="Переопределить множитель ATR для стоп-лосса")
     
     # Добавляем недостающие аргументы для консистентности
