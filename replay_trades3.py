@@ -371,14 +371,14 @@ def main():
     ap.add_argument("--cashflows", type=str, default="cashflows.json", help="JSON с депозитами/выводами")
     ap.add_argument("--out-prefix", default="trades_replay", help="префикс для файлов вывода")
 
-    # --- Новые флаги для переопределения ---
-    ap.add_argument("--disable-htf-filter", dest="use_htf_filter_override", action="store_false", help="Принудительно отключить HTF-фильтр")
-    ap.add_argument("--enable-htf-filter", dest="use_htf_filter_override", action="store_true", help="Принудительно включить HTF-фильтр")
-    ap.set_defaults(use_htf_filter_override=None)
+    # --- Флаги для переопределения настроек из JSON ---
+    ap.add_argument("--disable-htf-filter", dest="use_htf_filter", action="store_false", help="Принудительно отключить HTF-фильтр")
+    ap.add_argument("--enable-htf-filter", dest="use_htf_filter", action="store_true", help="Принудительно включить HTF-фильтр")
+    ap.set_defaults(use_htf_filter=None)
 
-    ap.add_argument("--disable-stop-loss", dest="use_stop_loss_override", action="store_false", help="Принудительно отключить Stop-Loss")
-    ap.add_argument("--enable-stop-loss", dest="use_stop_loss_override", action="store_true", help="Принудительно включить Stop-Loss")
-    ap.set_defaults(use_stop_loss_override=None)
+    ap.add_argument("--disable-stop-loss", dest="use_stop_loss", action="store_false", help="Принудительно отключить Stop-Loss")
+    ap.add_argument("--enable-stop-loss", dest="use_stop_loss", action="store_true", help="Принудительно включить Stop-Loss")
+    ap.set_defaults(use_stop_loss=None)
     
     ap.add_argument("--sl-atr-multiplier", type=float, default=None, help="Переопределить множитель ATR для стоп-лосса")
 
@@ -403,20 +403,26 @@ def main():
     # HTF filter
     htf_filter_settings = cfg.get("htf_filter", {})
     use_htf = htf_filter_settings.get("use", False)
-    if args.use_htf_filter_override is not None:
-        use_htf = args.use_htf_filter_override # Переопределение из CLI
-    htf_tf = htf_filter_settings.get("timeframe")
-    htf_supertrend_period = htf_filter_settings.get("supertrend_period")
-    htf_supertrend_multiplier = htf_filter_settings.get("supertrend_multiplier")
+    if args.use_htf_filter is not None:
+        use_htf = args.use_htf_filter # Переопределение из CLI
+    htf_tf = htf_filter_settings.get("timeframe", "4h")
+    htf_supertrend_period = htf_filter_settings.get("supertrend_period", 14)
+    htf_supertrend_multiplier = htf_filter_settings.get("supertrend_multiplier", 2.5)
 
     # Stop-Loss
     sl_settings = cfg.get("stop_loss", {})
     use_sl = sl_settings.get("use", False)
-    if args.use_stop_loss_override is not None:
-        use_sl = args.use_stop_loss_override # Переопределение из CLI
+    if args.use_stop_loss is not None:
+        use_sl = args.use_stop_loss # Переопределение из CLI
         
-    sl_mult_from_file = cfg.get("stop_loss", {}).get("atr_multiplier")
-    sl_mult = args.sl_atr_multiplier if args.sl_atr_multiplier is not None else float(sl_mult_from_file) if sl_mult_from_file is not None else 3.0
+    sl_mult_from_file = sl_settings.get("atr_multiplier")
+    # Приоритет: CLI -> JSON -> Дефолт
+    if args.sl_atr_multiplier is not None:
+        sl_mult = args.sl_atr_multiplier
+    elif sl_mult_from_file is not None:
+        sl_mult = float(sl_mult_from_file)
+    else:
+        sl_mult = 3.0
 
     # --- Читаем модель ---
     pack = joblib.load(args.model)
