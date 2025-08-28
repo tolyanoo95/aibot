@@ -165,6 +165,7 @@ def positions_hysteresis_numeric(proba: pd.Series,
         out.append(state)
     return pd.Series(out, index=proba.index, dtype=int)
 
+
 def decide_signal(proba_s: pd.Series, thresholds: dict, min_hold: int, cooldown: int):
     """Возвращает решение по последнему закрытому бару."""
     pos_raw = positions_hysteresis_numeric(
@@ -431,9 +432,6 @@ class LiveTrader:
                 print(f"HTF filter blocks SHORT signal (HTF trend is UP)")
                 sig['action'] = "STAY_FLAT"; sig['next_state'] = 0
 
-        # Отладочный принт, чтобы понять, что происходит после SL
-        #print(f"\n[DEBUG] pos_before_correction={self.current_pos}, sig_from_model={sig}\n")
-
         # --- Process Signal: сверяем "совет" модели с реальным состоянием ---
         # 1. Модель советует войти, но мы уже в позиции -> исправляем на "ДЕРЖАТЬ"
         if sig['action'] in ("ENTER_LONG", "ENTER_SHORT") and self.current_pos != 0:
@@ -443,10 +441,12 @@ class LiveTrader:
         elif sig['action'] == "EXIT_TO_FLAT" and self.current_pos == 0:
             sig['action'] = "STAY_FLAT"
             sig['next_state'] = 0
-        # 3. Модель советует "ДЕРЖАТЬ", но мы вне рынка (например, после SL) -> исправляем на "БЕЗ ДЕЙСТВИЙ"
-        elif sig['action'] in ("HOLD_LONG", "HOLD_SHORT") and self.current_pos == 0:
-            sig['action'] = "STAY_FLAT"
-            sig['next_state'] = 0
+        # 3. Модель советует "ДЕРЖАТЬ ЛОНГ", но мы вне рынка -> это сигнал на ВХОД
+        elif sig['action'] == 'HOLD_LONG' and self.current_pos == 0:
+            sig['action'] = 'ENTER_LONG'
+        # 4. Модель советует "ДЕРЖАТЬ ШОРТ", но мы вне рынка -> это сигнал на ВХОД
+        elif sig['action'] == 'HOLD_SHORT' and self.current_pos == 0:
+            sig['action'] = 'ENTER_SHORT'
 
         tf_delta = timeframe_to_timedelta(self.timeframe)
         decision_bar_open_ts = sig["bar_open_ts"]
