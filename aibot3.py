@@ -561,7 +561,7 @@ def search_thresholds_and_sl(proba: pd.Series, df_feat: pd.DataFrame, tf: str,
     grid_enter_s = [0.15, 0.10, 0.07]
     grid_exit_s  = [0.35, 0.30]
     grid_hold = [24, 36, 48]
-    cooldowns = [12, 24]
+    cooldowns = [0]
     sl_mults = [0, 2.0, 2.5, 3.0] # 0 = SL выключен
 
     best, best_stats = None, None
