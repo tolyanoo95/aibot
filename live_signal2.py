@@ -360,6 +360,7 @@ class LiveTrader:
                 self.pending_exec = None
 
         # --- Stop-Loss Check (on previous, now-closed bar) ---
+        sl_exit_action = None
         if self.current_pos != 0 and self.use_stop_loss and not np.isnan(self.sl_price):
             last_closed_bar = df.iloc[-2]
             
@@ -395,7 +396,7 @@ class LiveTrader:
                 self.entry_price, self.sl_price = np.nan, np.nan
                 self.peak_since_entry, self.trough_since_entry = np.nan, np.nan # Сброс
                 self.last_seen_bar_open = df.index[-1] # Skip normal signal on this bar
-                return
+                sl_exit_action = sig['action']
 
         # --- Feature & Proba Calculation ---
         feat = build_features(df)
@@ -407,6 +408,10 @@ class LiveTrader:
         # --- New Bar Check ---
         current_bar_open = proba_s.index[-1]
         if self.last_seen_bar_open is not None and current_bar_open == self.last_seen_bar_open:
+            return
+
+        # Если мы только что вышли по SL, то на этом баре больше ничего не делаем
+        if sl_exit_action == "EXIT_BY_SL":
             return
 
         # --- Signal Decision ---
@@ -426,12 +431,22 @@ class LiveTrader:
                 print(f"HTF filter blocks SHORT signal (HTF trend is UP)")
                 sig['action'] = "STAY_FLAT"; sig['next_state'] = 0
 
-        # --- Process Signal ---
-        # Don't enter if already in position, don't exit if already flat
-        if (sig['action'] in ("ENTER_LONG", "ENTER_SHORT") and self.current_pos != 0) or \
-           (sig['action'] == "EXIT_TO_FLAT" and self.current_pos == 0):
-            sig['action'] = "HOLD_LONG" if self.current_pos == 1 else ("HOLD_SHORT" if self.current_pos == -1 else "STAY_FLAT")
+        # Отладочный принт, чтобы понять, что происходит после SL
+        #print(f"\n[DEBUG] pos_before_correction={self.current_pos}, sig_from_model={sig}\n")
+
+        # --- Process Signal: сверяем "совет" модели с реальным состоянием ---
+        # 1. Модель советует войти, но мы уже в позиции -> исправляем на "ДЕРЖАТЬ"
+        if sig['action'] in ("ENTER_LONG", "ENTER_SHORT") and self.current_pos != 0:
+            sig['action'] = "HOLD_LONG" if self.current_pos == 1 else "HOLD_SHORT"
             sig['next_state'] = self.current_pos
+        # 2. Модель советует выйти, но мы уже вне рынка -> исправляем на "БЕЗ ДЕЙСТВИЙ"
+        elif sig['action'] == "EXIT_TO_FLAT" and self.current_pos == 0:
+            sig['action'] = "STAY_FLAT"
+            sig['next_state'] = 0
+        # 3. Модель советует "ДЕРЖАТЬ", но мы вне рынка (например, после SL) -> исправляем на "БЕЗ ДЕЙСТВИЙ"
+        elif sig['action'] in ("HOLD_LONG", "HOLD_SHORT") and self.current_pos == 0:
+            sig['action'] = "STAY_FLAT"
+            sig['next_state'] = 0
 
         tf_delta = timeframe_to_timedelta(self.timeframe)
         decision_bar_open_ts = sig["bar_open_ts"]
