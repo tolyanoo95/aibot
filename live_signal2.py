@@ -331,7 +331,7 @@ class LiveTrader:
             trend_is_up = trend_direction.iloc[-1]
             
             htf_status = "UP" if trend_is_up else "DOWN"
-            print(f"HTF({self.htf_timeframe}) Supertrend is {htf_status}.")
+            #print(f"HTF({self.htf_timeframe}) Supertrend is {htf_status}.")
         
         # --- Execution Confirmation ---
         if self.pending_exec is not None:
