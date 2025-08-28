@@ -198,7 +198,7 @@ def decide_signal(proba_s: pd.Series, thresholds: dict, min_hold: int, cooldown:
 # ----------------- pretty print -----------------
 def print_every_bar(sig: dict, symbol: str, decision_ts: pd.Timestamp,
                     decision_price: float, planned_exec_ts: pd.Timestamp,
-                    current_pos: int, sl_price: float | None = None):
+                    current_pos: int, sl_price: float | None = None, htf_status: str = "OFF"):
     """Печатает решение на каждом закрытом баре."""
     action = sig["action"]
     
@@ -214,8 +214,9 @@ def print_every_bar(sig: dict, symbol: str, decision_ts: pd.Timestamp,
         # Информативная строка, когда входа нет
         human = {"HOLD_LONG":"ДЕРЖАТЬ LONG", "HOLD_SHORT":"ДЕРЖАТЬ SHORT", 
                  "STAY_FLAT":"БЕЗ ДЕЙСТВИЙ", "EXIT_TO_FLAT":"ВЫЙТИ В НОЛЬ"}
-        sl_info = f", SL={sl_price:.8f}" if sl_price is not None else ""
-        print(f"РЕШЕНИЕ: {human.get(action, action)} (pos={pos_map[sig['next_state']]}{sl_info}, "
+        sl_info = f", SL={sl_price:.8f}" if sl_price is not None and not np.isnan(sl_price) else ", SL=nan"
+        htf_info = f", HTF={htf_status}"
+        print(f"РЕШЕНИЕ: {human.get(action, action)} (pos={pos_map[sig['next_state']]}{htf_info}{sl_info}, "
               f"proba={sig['proba']:.4f}) @ {decision_ts}  — {symbol} - {decision_price:.8f}")
         
     # Всегда показываем, когда планируется исполнение
@@ -316,6 +317,7 @@ class LiveTrader:
 
         # --- HTF Filter Calculation ---
         trend_is_up = None # True-up, False-down, None-не используется
+        htf_status = "OFF"
         if self.use_htf_filter:
             main_tf_mins = timeframe_to_minutes(self.timeframe)
             htf_tf_mins = timeframe_to_minutes(self.htf_timeframe)
@@ -385,7 +387,7 @@ class LiveTrader:
                 tf_delta = timeframe_to_timedelta(self.timeframe)
                 decision_ts = last_closed_bar.name + tf_delta
                 sig = {"action": "EXIT_BY_SL", "proba": np.nan, "next_state": 0}
-                print_every_bar(sig, self.symbol, decision_ts, last_closed_bar['c'], None, self.current_pos, self.sl_price)
+                print_every_bar(sig, self.symbol, decision_ts, last_closed_bar['c'], None, self.current_pos, self.sl_price, htf_status=htf_status)
                 
                 # Log and reset state
                 self.log_decision(sig, decision_ts, last_closed_bar.name, last_closed_bar['c'], None)
@@ -437,7 +439,7 @@ class LiveTrader:
         planned_exec_ts = decision_ts
         decision_price = float(df["c"].reindex(proba_s.index).iloc[-1])
         
-        print_every_bar(sig, self.symbol, decision_ts, decision_price, planned_exec_ts, self.current_pos, self.sl_price)
+        print_every_bar(sig, self.symbol, decision_ts, decision_price, planned_exec_ts, self.current_pos, self.sl_price, htf_status=htf_status)
         
         self.log_decision(sig, decision_ts, decision_bar_open_ts, decision_price, planned_exec_ts)
 
