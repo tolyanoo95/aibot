@@ -10,8 +10,10 @@ import ccxt
 from datetime import datetime, timezone
 
 from ta.momentum import RSIIndicator
-from ta.trend import SMAIndicator, MACD
+from ta.trend import SMAIndicator, MACD, ADXIndicator
 from ta.volatility import BollingerBands
+from ta.volatility import AverageTrueRange
+from ta.volume import OnBalanceVolumeIndicator
 
 import lightgbm as lgb
 from lightgbm import LGBMClassifier
@@ -29,7 +31,7 @@ pd.set_option("display.max_columns", 60)
 # ----------------------------- Defaults -----------------------------
 DEFAULT_SYMBOL = "SOL/USDT"
 DEFAULT_TIMEFRAME = "15m"
-DEFAULT_MAX_BARS = 60000           # ~2-3 года на 15m
+DEFAULT_MAX_BARS = 100000           # ~2-3 года на 15m
 DEFAULT_HORIZON_BARS = 24 #48            # горизонт цели (≈ 6ч для 15m)
 DEFAULT_SMOOTH_SPAN = 12 #36            # EMA сглаживание вероятностей
 FEE_PER_SIDE = 0.0003                # комиссия на сторону (0.03%)
@@ -37,7 +39,7 @@ SLIPPAGE_PER_SIDE = 0.0001           # проскальзывание на ст�
 RANDOM_STATE = 42
 DEFAULT_TURNOVER_CAP = 0.05 #0.02         # макс. поворотов на бар
 DEFAULT_MAX_DD_CAP = 0.40            # макс. просадка для отбора порогов
-DEFAULT_LAST_DAYS = 0                # окно "последние N дней", 0=выключено
+DEFAULT_LAST_DAYS = 30                # окно "последние N дней", 0=выключено
 
 # ----------------------------- Utils -----------------------------
 def timeframe_to_minutes(tf: str) -> int:
@@ -101,6 +103,46 @@ def fetch_ohlcv_all(exchange, symbol, timeframe='15m',
     df.set_index("ts", inplace=True)
     return df
 
+def calculate_supertrend(df: pd.DataFrame, atr_period: int = 10, atr_multiplier: float = 3.0) -> tuple[pd.Series, pd.Series]:
+    """Вычисляет Supertrend и возвращает (линия Supertrend, направление тренда True/False)."""
+    df = df.copy()
+    df['h'] = pd.to_numeric(df['h'], errors='coerce')
+    df['l'] = pd.to_numeric(df['l'], errors='coerce')
+    df['c'] = pd.to_numeric(df['c'], errors='coerce')
+    
+    atr = AverageTrueRange(high=df['h'], low=df['l'], close=df['c'], window=atr_period).average_true_range()
+    
+    hl2 = (df['h'] + df['l']) / 2
+    upper_band = hl2 + (atr_multiplier * atr)
+    lower_band = hl2 - (atr_multiplier * atr)
+    
+    in_uptrend = pd.Series(True, index=df.index)
+    supertrend_line = pd.Series(np.nan, index=df.index)
+
+    for i in range(1, len(df)):
+        current = i
+        previous = i - 1
+        
+        if df['c'].iloc[current] > upper_band.iloc[previous]:
+            in_uptrend.iloc[current] = True
+        elif df['c'].iloc[current] < lower_band.iloc[previous]:
+            in_uptrend.iloc[current] = False
+        else:
+            in_uptrend.iloc[current] = in_uptrend.iloc[previous]
+
+        if in_uptrend.iloc[current] and lower_band.iloc[current] < lower_band.iloc[previous]:
+            lower_band.iloc[current] = lower_band.iloc[previous]
+        
+        if not in_uptrend.iloc[current] and upper_band.iloc[current] > upper_band.iloc[previous]:
+            upper_band.iloc[current] = upper_band.iloc[previous]
+
+        if in_uptrend.iloc[current]:
+            supertrend_line.iloc[current] = lower_band.iloc[current]
+        else:
+            supertrend_line.iloc[current] = upper_band.iloc[current]
+            
+    return supertrend_line, in_uptrend
+
 # ----------------------------- Features & Labels -----------------------------
 def build_features(df: pd.DataFrame) -> pd.DataFrame:
     d = df.copy()
@@ -111,15 +153,27 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     d['ret5']  = d['c'].pct_change(5)
     d['ret20'] = d['c'].pct_change(20)
 
-    d['rsi'] = RSIIndicator(d['c'], window=14).rsi()
+    # --- Убираем RSI, добавляем ADX ---
+    adx_ind = ADXIndicator(high=d['h'], low=d['l'], close=d['c'], window=14)
+    d['adx'] = adx_ind.adx()
+    d['adx_pos'] = adx_ind.adx_pos()
+    d['adx_neg'] = adx_ind.adx_neg()
 
     d['sma20'] = SMAIndicator(d['c'], 20).sma_indicator()
     d['sma50'] = SMAIndicator(d['c'], 50).sma_indicator()
-    d['sma_ratio'] = d['sma20'] / d['sma50'] - 1
+    
+    # Новый признак на основе Supertrend
+    st_line, _ = calculate_supertrend(d, atr_period=14, atr_multiplier=2.5)
+    d['st_dist'] = (d['c'] / st_line - 1).replace([np.inf, -np.inf], 0)
 
+    # Новый, более робастный признак долгосрочного тренда
+    d['sma200'] = SMAIndicator(d['c'], 200).sma_indicator()
+    d['sma_ratio_long'] = d['sma50'] / d['sma200'] - 1
+    
     macd = MACD(d['c'])
-    d['macd']      = macd.macd()
-    d['macd_sig']  = macd.macd_signal()
+    # Нормализуем MACD
+    d['macd_norm']      = macd.macd() / d['sma50']
+    d['macd_sig_norm']  = macd.macd_signal() / d['sma50']
     d['macd_diff'] = macd.macd_diff()
 
     bb = BollingerBands(d['c'], window=20, window_dev=2.0)
@@ -127,15 +181,31 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     d['bb_pos'] = (d['c'] - bb.bollinger_mavg()) / rng
 
     d['vol20'] = d['ret1'].rolling(20).std()
+
+    # --- Признаки на основе объемов ---
+    v_sma50 = d['v'].rolling(50).mean()
+    d['v_sma_ratio'] = (d['v'] / v_sma50 - 1).replace([np.inf, -np.inf], 0)
+    obv = OnBalanceVolumeIndicator(d['c'], d['v']).on_balance_volume()
+    d['obv_momentum'] = obv.pct_change(50).replace([np.inf, -np.inf], 0)
+    
+    # ATR for Stop-Loss
+    atr = AverageTrueRange(high=d['h'], low=d['l'], close=d['c'], window=14)
+    d['atr'] = atr.average_true_range()
+    
+    # Нормализованный ATR для оценки волатильности относительно цены
+    d['atr_norm'] = d['atr'] / d['sma20']
+
     d = d.dropna()
     return d
 
-def make_labels_binary(df_feat: pd.DataFrame, horizon_bars: int,
-                       fee_per_side=FEE_PER_SIDE, slippage_per_side=SLIPPAGE_PER_SIDE) -> pd.Series:
-    """1 — если будущая доходность за H баров > полных издержек (вход+выход)"""
-    fee_round_trip = 2.0 * (fee_per_side + slippage_per_side)
-    fwd = df_feat['c'].shift(-horizon_bars) / df_feat['c'] - 1.0
-    y = (fwd > fee_round_trip).astype(int)
+def make_labels_supertrend(df_feat: pd.DataFrame, horizon_bars: int) -> pd.Series:
+    """
+    Новая целевая переменная: предсказываем будущее направление Supertrend.
+    1 - если Supertrend через `horizon_bars` будет восходящим.
+    0 - если нисходящим.
+    """
+    _, trend_direction = calculate_supertrend(df_feat, atr_period=14, atr_multiplier=2.5)
+    y = trend_direction.shift(-horizon_bars).fillna(0).astype(int)
     return y
 
 # ----------------------------- CV: purged / embargo -----------------------------
@@ -277,6 +347,133 @@ def _align_by_open_next(df: pd.DataFrame, proba: pd.Series):
     proba = proba.loc[ret.index]             # решение на close[t], исполнение на open[t+1]
     return df, ret, proba
 
+def _run_backtest_engine(df: pd.DataFrame, proba: pd.Series, tf: str, thresholds: dict,
+                         min_hold: int, cooldown: int, fee_per_side: float, slippage_per_side: float,
+                         trend_filter: pd.Series | None, use_stop_loss: bool, sl_atr_multiplier: float) -> dict:
+    idx = df.index.intersection(proba.index)
+    if len(idx) < 10:
+        return {'pos': pd.Series(dtype=int), 'ret': pd.Series(dtype=float)}
+        
+    df = df.loc[idx]
+    proba = proba.loc[idx]
+    
+    if trend_filter is not None:
+        trend_filter = trend_filter.reindex(idx, method='ffill').fillna(False)
+    if use_stop_loss and 'atr' not in df.columns:
+        raise ValueError("ATR column not found for Stop-Loss.")
+        
+    cost_per_side = fee_per_side + slippage_per_side
+    pos, hold_bars, cd_bars = 0, 0, 0
+    entry_price, sl_price = np.nan, np.nan
+    # Новые переменные для Trailing SL
+    peak_since_entry, trough_since_entry = np.nan, np.nan
+    positions, returns = [], []
+    # Новые флаги для блокировки после SL
+    sl_cooldown_long, sl_cooldown_short = False, False
+
+    for i in range(len(df) - 1):
+        ts, p = df.index[i], proba.iloc[i]
+        is_exit, exit_price = False, np.nan
+        is_sl_exit = False # Флаг для отличия выхода по SL от выхода по сигналу
+        current_pos = pos
+        
+        # 0. Сброс блокировки, если proba вернулась в "безопасную" зону
+        if sl_cooldown_long and p < thresholds['exit_long']:
+            sl_cooldown_long = False
+        if sl_cooldown_short and p > thresholds['exit_short']:
+            sl_cooldown_short = False
+
+        # 1. Проверка на Stop-Loss (приоритет)
+        if current_pos != 0 and use_stop_loss and not np.isnan(sl_price):
+            # Сначала обновляем Trailing Stop
+            if current_pos == 1:
+                peak_since_entry = max(peak_since_entry, df['h'].iloc[i])
+                new_sl = peak_since_entry - sl_atr_multiplier * df['atr'].iloc[i]
+                sl_price = max(sl_price, new_sl) # Стоп может только двигаться вверх
+            elif current_pos == -1:
+                trough_since_entry = min(trough_since_entry, df['l'].iloc[i])
+                new_sl = trough_since_entry + sl_atr_multiplier * df['atr'].iloc[i]
+                sl_price = min(sl_price, new_sl) # Стоп может только двигаться вниз
+
+            # Теперь проверяем срабатывание
+            if (current_pos == 1 and df['l'].iloc[i] <= sl_price) or \
+               (current_pos == -1 and df['h'].iloc[i] >= sl_price):
+                is_exit, exit_price = True, sl_price
+                is_sl_exit = True
+        
+        # 2. Проверка на выход по сигналу
+        if not is_exit and current_pos != 0 and hold_bars >= min_hold:
+            if (current_pos == 1 and p < thresholds['exit_long']) or \
+               (current_pos == -1 and p > thresholds['exit_short']):
+                is_exit = True
+        
+        # 3. Проверка на вход
+        is_entry = False
+        if current_pos == 0 and cd_bars == 0:
+            # СНАЧАЛА определяем намерение войти
+            entry_side = 0
+            if p > thresholds['enter_long']:
+                entry_side = 1
+            elif p < thresholds['enter_short']:
+                entry_side = -1
+            
+            # ТЕПЕРЬ применяем фильтры к намерению
+            if entry_side == 1:
+                can_long = trend_filter is None or trend_filter.iloc[i]
+                if can_long and not sl_cooldown_long:
+                    is_entry, pos = True, 1
+            elif entry_side == -1:
+                can_short = trend_filter is None or not trend_filter.iloc[i]
+                if can_short and not sl_cooldown_short:
+                    is_entry, pos = True, -1
+
+        # 4. Расчет доходности и обновление состояния
+        ret_i = 0.0
+        if is_exit:
+            exit_price = df['o'].iloc[i+1] if np.isnan(exit_price) else exit_price
+            gross_ret = (exit_price / entry_price - 1) if current_pos == 1 else (entry_price / exit_price - 1)
+            ret_i = (1 + gross_ret) * (1 - cost_per_side) - 1 # учитываем только комиссию на выход
+            
+            if is_sl_exit:
+                if current_pos == 1: sl_cooldown_long = True
+                if current_pos == -1: sl_cooldown_short = True
+
+            pos, hold_bars, cd_bars = 0, 0, cooldown
+            entry_price, sl_price = np.nan, np.nan
+            peak_since_entry, trough_since_entry = np.nan, np.nan # Сброс
+        
+        if is_entry:
+            entry_price = df['o'].iloc[i+1]
+            ret_i -= cost_per_side # комиссия на вход
+            hold_bars = 1
+            if use_stop_loss:
+                atr_val = df['atr'].iloc[i]
+                # --- FIX: Добавляем проверку на NaN ---
+                if atr_val is not None and not np.isnan(atr_val):
+                    if pos == 1:
+                        sl_price = entry_price - sl_atr_multiplier * atr_val
+                        peak_since_entry = entry_price
+                    else: # pos == -1
+                        sl_price = entry_price + sl_atr_multiplier * atr_val
+                        trough_since_entry = entry_price
+                else:
+                    sl_price = np.nan # Не ставим SL, если ATR некорректен
+        
+        # Если позиция удерживается
+        if pos != 0 and not is_exit and not is_entry:
+            ret_i = (df['o'].iloc[i+1] / df['o'].iloc[i] - 1) * pos
+            hold_bars += 1
+        
+        returns.append(ret_i)
+        positions.append(pos)
+        
+        if cd_bars > 0 and pos == 0:
+            cd_bars -= 1
+            
+    pos_s = pd.Series(positions, index=df.index[:-1])
+    ret_s = pd.Series(returns, index=df.index[:-1])
+    return {'pos': pos_s, 'ret': ret_s}
+
 def backtest_hysteresis_open_next(df: pd.DataFrame, proba: pd.Series, tf: str,
                                   enter_long_q=0.90, exit_long_q=0.70,
                                   enter_short_q=0.10, exit_short_q=0.30,
@@ -380,67 +577,97 @@ def backtest_hysteresis_fixed_thresholds_open(df: pd.DataFrame, proba: pd.Series
     )
 
 # ----------------------------- Threshold search -----------------------------
-def search_thresholds(proba: pd.Series, df_feat: pd.DataFrame, tf: str,
-                      turnover_cap=DEFAULT_TURNOVER_CAP, max_dd_cap=DEFAULT_MAX_DD_CAP,
-                      fee_per_side=FEE_PER_SIDE, slippage_per_side=SLIPPAGE_PER_SIDE):
+def search_thresholds_and_sl(proba: pd.Series, df_feat: pd.DataFrame, tf: str,
+                           trend_filter: pd.Series | None,
+                           turnover_cap=DEFAULT_TURNOVER_CAP, max_dd_cap=DEFAULT_MAX_DD_CAP,
+                           fee_per_side=FEE_PER_SIDE, slippage_per_side=SLIPPAGE_PER_SIDE):
     """
-    Перебор порогов + min_hold/cooldown.
-    Возвращает лучший по Sharpe в cap и лучший без cap (loose).
+    Перебор порогов + min_hold/cooldown + SL multiplier.
+    Использует итеративный движок _run_backtest_engine.
     """
-    grid_enter = [0.80, 0.85, 0.90, 0.93]
-    grid_exit  = [0.60, 0.65, 0.70]
-    grid_enter_s = [0.20, 0.15, 0.10, 0.07]
-    grid_exit_s  = [0.40, 0.35, 0.30]
-    grid_hold = [16, 24, 36, 48]
-    cooldowns = [4, 12, 24]
+    grid_enter = [0.85, 0.90, 0.93]
+    grid_exit  = [0.65, 0.70]
+    grid_enter_s = [0.15, 0.10, 0.07]
+    grid_exit_s  = [0.35, 0.30]
+    grid_hold = [0] # grid_hold = [24, 36, 48]
+    cooldowns = [0]
+    sl_mults = [0, 2.0, 2.5, 3.0] # 0 = SL выключен
 
     best, best_stats = None, None
     best_loose, best_loose_stats = None, None
+    
+    q = proba.quantile
+    bpy = bars_per_year(tf)
 
-    for el in grid_enter:
-        for xl in grid_exit:
-            if xl >= el:
-                continue
-            for es in grid_enter_s:
-                for xs in grid_exit_s:
-                    if xs <= es:
-                        continue
-                    for mh in grid_hold:
-                        for cd in cooldowns:
-                            stats = backtest_hysteresis_open_next(
-                                df_feat, proba, tf,
-                                enter_long_q=el, exit_long_q=xl,
-                                enter_short_q=es, exit_short_q=xs,
-                                min_hold=mh, cooldown=cd,
-                                fee_per_side=fee_per_side, slippage_per_side=slippage_per_side
-                            )
-                            if stats['n_bars'] == 0:
-                                continue
-                            tp_bar = stats['turns'] / max(1, stats['n_bars'])
-                            # лучший без ограничений
-                            if (best_loose is None) or (stats['sharpe'] > best_loose_stats['sharpe']):
-                                best_loose, best_loose_stats = (el, xl, es, xs, mh, cd), stats
-                            # ограничения по обороту и MaxDD
-                            if tp_bar <= turnover_cap and stats['max_dd'] >= -max_dd_cap:
-                                if (best is None) or (stats['sharpe'] > best_stats['sharpe']):
-                                    best, best_stats = (el, xl, es, xs, mh, cd), stats
+    # Создаем декартово произведение всех параметров для tqdm
+    from itertools import product
+    param_grid = list(product(grid_enter, grid_exit, grid_enter_s, grid_exit_s, grid_hold, cooldowns, sl_mults))
+    
+    # Обертка для прогресс-бара
+    from tqdm import tqdm
+    
+    print(f"Searching thresholds across {len(param_grid)} combinations...")
+    for el, xl, es, xs, mh, cd, sl_mult in tqdm(param_grid):
+        if xl >= el or xs <= es:
+            continue
+            
+        th = {'enter_long': q(el), 'exit_long': q(xl), 'enter_short': q(es), 'exit_short': q(xs)}
+        
+        res = _run_backtest_engine(
+            df=df_feat, proba=proba, tf=tf, thresholds=th,
+            min_hold=mh, cooldown=cd,
+            fee_per_side=fee_per_side, slippage_per_side=slippage_per_side,
+            trend_filter=trend_filter,
+            use_stop_loss=sl_mult > 0, sl_atr_multiplier=sl_mult
+        )
+        
+        strat_ret = res['ret']
+        pos_raw = res['pos']
+        
+        if strat_ret.empty or pos_raw.empty:
+            continue
+            
+        # Считаем метрики на лету
+        eq = (1.0 + strat_ret).cumprod()
+        mdd = max_drawdown(eq)
+        sharpe = (strat_ret.mean() / (strat_ret.std() + 1e-12)) * np.sqrt(bpy) if not strat_ret.empty else 0.0
+        
+        n_bars = len(strat_ret)
+        turns = pos_raw.diff().abs().sum()
+        tp_bar = turns / max(1, n_bars)
+        
+        stats = {
+            'sharpe': sharpe, 'max_dd': mdd, 'n_bars': n_bars, 'turns': turns,
+            'long_share': (pos_raw == 1).mean(), 'short_share': (pos_raw == -1).mean(),
+            'neutral_share': (pos_raw == 0).mean(), 'thresholds': th, 'pos': pos_raw, 'ret': strat_ret
+        }
+
+        params = (el, xl, es, xs, mh, cd, sl_mult)
+        
+        if (best_loose is None) or (stats['sharpe'] > best_loose_stats['sharpe']):
+            best_loose, best_loose_stats = params, stats
+            
+        if tp_bar <= turnover_cap and stats['max_dd'] >= -max_dd_cap:
+            if (best is None) or (stats['sharpe'] > best_stats['sharpe']):
+                best, best_stats = params, stats
+                
     return best, best_stats, best_loose, best_loose_stats
 
 # ----------------------------- Trades (open-exec) & JSON -----------------------------
-def extract_trades_from_pos_open(df: pd.DataFrame, pos_exec: pd.Series,
+def extract_trades_from_pos_open(pos_s: pd.Series, df: pd.DataFrame,
                                  fee_per_side=FEE_PER_SIDE, slippage_per_side=SLIPPAGE_PER_SIDE) -> pd.DataFrame:
     """
-    df: ожидается ['o','c'] с одинаковым индексом с pos_exec.
+    df: должен содержать 'o', 'c' с тем же индексом, что и pos_s.
     Вход/выход по open ценам. Издержки мультипликативные на вход и на выход.
     """
     df = df[['o','c']].copy()
-    idx = df.index.intersection(pos_exec.index)
+    idx = df.index.intersection(pos_s.index)
     if len(idx) == 0:
         return pd.DataFrame(columns=['side','entry_ts','exit_ts','entry_price','exit_price','gross_ret','net_ret','net_pct','bars','win'])
 
     o = df.loc[idx, 'o'].astype(float)
     c = df.loc[idx, 'c'].astype(float)  # для справки можно хранить
-    ps = pos_exec.loc[idx].astype(int)
+    ps = pos_s.loc[idx].astype(int)
 
     cost_side = float(fee_per_side + slippage_per_side)
     trades = []; cur = None  # {'side': 1/-1, 'entry_ts', 'entry_price', 'entry_i'}
@@ -573,15 +800,17 @@ def equity_with_cashflows(strat_ret: pd.Series, initial_capital: float, cflows_o
     return series, dep, wd, final_value, profit, roi
 
 # ----------------------------- Summary -----------------------------
-def summarize_trades(trades: pd.DataFrame, timeframe: str) -> str:
+def summarize_trades(trades: pd.DataFrame, timeframe: str) -> dict:
     if trades is None or trades.empty:
-        return "Сделок не найдено."
+        return {
+            'n_trades': 0, 'winrate': 0.0, 'profit_factor': 0.0, 'expectancy_pct': 0.0,
+            'avg_win_pct': 0.0, 'avg_loss_pct': 0.0, 'avg_hold_hours': 0.0,
+            'max_win_streak': 0, 'max_loss_streak': 0
+        }
 
     total = len(trades)
     wins = trades[trades["win"]]
     losses = trades[~trades["win"]]
-
-    def pct(x): return 100.0 * float(x)
 
     winrate = trades["win"].mean() if len(trades) else 0.0
     pf = (wins["net_ret"].sum() / abs(losses["net_ret"].sum())) if len(losses) and abs(losses["net_ret"].sum()) > 1e-12 else np.inf
@@ -599,14 +828,13 @@ def summarize_trades(trades: pd.DataFrame, timeframe: str) -> str:
         else:
             cur_l += 1; max_l = max(max_l, cur_l); cur_w = 0
 
-    lines = []
-    lines.append(f"Всего сделок: {total}")
-    lines.append(f"Winrate: {pct(winrate):.1f}%")
-    lines.append(f"Profit factor: {pf:.2f}  |  Expectancy/сделка: {pct(exp):.2f}%")
-    lines.append(f"Средняя длительность: {avg_bars:.1f} баров (~{avg_hours:.1f} ч)")
-    lines.append(f"Серии — побед: {max_w} | убыточных: {max_l}")
-    lines.append(f"Средняя прибыльная: {pct(wins['net_ret'].mean() if len(wins) else 0):.2f}%  |  Средняя убыточная: {pct(losses['net_ret'].mean() if len(losses) else 0):.2f}%")
-    return "\n".join(lines)
+    return {
+        'n_trades': total, 'winrate': winrate, 'profit_factor': pf, 'expectancy_pct': exp * 100,
+        'avg_win_pct': (wins['net_pct'].mean() if len(wins) else 0.0),
+        'avg_loss_pct': (losses['net_pct'].mean() if len(losses) else 0.0),
+        'avg_hold_hours': avg_hours,
+        'max_win_streak': max_w, 'max_loss_streak': max_l
+    }
 
 # ----------------------------- main -----------------------------
 def main():
@@ -626,10 +854,27 @@ def main():
     parser.add_argument("--cv-embargo", type=int, default=None, help="embargo bars (по умолчанию = horizon//2)")
     parser.add_argument("--calibrate", type=str, default="none", choices=["none","isotonic","platt"], help="калибровка вероятностей по последнему окну")
     parser.add_argument("--plot", action="store_true")
+    
+    # --- Trend Filter arguments ---
+    # By default, HTF filter is ON. Use a flag to disable it.
+    parser.add_argument("--disable-htf-filter", dest="use_htf_filter", action="store_false", help="Отключить фильтр по Supertrend на старшем таймфрейме")
+    parser.set_defaults(use_htf_filter=True)
+
+    # Supertrend-specific args
+    parser.add_argument("--htf-timeframe", type=str, default="4h", help="Higher timeframe for Supertrend filter")
+    parser.add_argument("--htf-supertrend-period", type=int, default=14, help="Supertrend period on HTF")
+    parser.add_argument("--htf-supertrend-multiplier", type=float, default=2.5, help="Supertrend multiplier on HTF")
+
+    # Stop-Loss
+    parser.add_argument("--disable-stop-loss", dest="use_stop_loss", action="store_false", help="Отключить динамический стоп-лосс по ATR")
+    parser.set_defaults(use_stop_loss=True)
+    parser.add_argument("--sl-atr-multiplier", type=float, nargs='+', default=[2.0, 2.5, 3.0], help="Множитель ATR для стоп-лосса (можно несколько)")
+    
     args = parser.parse_args()
 
     purge = args.cv_purge if args.cv_purge is not None else args.horizon
     embargo = args.cv_embargo if args.cv_embargo is not None else max(1, args.horizon // 2)
+    bpy = bars_per_year(args.timeframe)
 
     print(f"Downloading: {args.symbol} {args.timeframe} (max {args.max_bars} bars)")
     ex = ccxt.binance(); ex.enableRateLimit = True
@@ -641,9 +886,21 @@ def main():
     print("Raw bars:", len(df))
 
     df_feat = build_features(df)
-    y = make_labels_binary(df_feat, args.horizon, FEE_PER_SIDE, SLIPPAGE_PER_SIDE)
+    y = make_labels_supertrend(df_feat, args.horizon)
 
-    feat_cols = ['ret1','ret3','ret5','ret20','rsi','sma_ratio','macd','macd_sig','macd_diff','bb_pos','vol20']
+    # Новый, более робастный набор признаков
+    feat_cols = [
+        # Сила и направление тренда
+        'adx', 'adx_pos', 'adx_neg',
+        # Подтверждение объемом
+        'v_sma_ratio', 'obv_momentum',
+        # Долгосрочное направление и моментум
+        'sma_ratio_long', 'macd_norm', 'macd_sig_norm',
+        # Положение относительно тренда
+        'st_dist',
+        # Волатильность
+        'vol20', 'atr_norm'
+    ]
     X = df_feat[feat_cols].shift(1).dropna()  # shift(1) — защита от утечки
     y = y.loc[X.index]
 
@@ -682,9 +939,22 @@ def main():
     except Exception:
         pass
 
+    # --- Глобальный фильтр: HTF Supertrend ---
+    trend_filter = None
+    if args.use_htf_filter:
+        print(f"Downloading HTF data: {args.symbol} {args.htf_timeframe}")
+        df_htf = fetch_ohlcv_all(ex, args.symbol, timeframe=args.htf_timeframe, max_bars=args.max_bars)
+        _, htf_trend_up = calculate_supertrend(df_htf, 
+                                               atr_period=args.htf_supertrend_period, 
+                                               atr_multiplier=args.htf_supertrend_multiplier)
+        # Растягиваем HTF-тренд на индекс основного таймфрейма
+        trend_filter = htf_trend_up.reindex(df_feat.index, method='ffill').fillna(False).rename("trend_up")
+        print(f"Supertrend filter calculated (TF={args.htf_timeframe}, period={args.htf_supertrend_period}, mult={args.htf_supertrend_multiplier}).")
+
     # ===== Подбор порогов (на всей истории)
-    best, best_stats, best_loose, best_loose_stats = search_thresholds(
+    best, best_stats, best_loose, best_loose_stats = search_thresholds_and_sl(
         proba_s, df_feat, args.timeframe,
+        trend_filter=trend_filter,
         turnover_cap=args.turnover_cap, max_dd_cap=args.max_dd_cap,
         fee_per_side=FEE_PER_SIDE, slippage_per_side=SLIPPAGE_PER_SIDE
     )
@@ -694,28 +964,35 @@ def main():
         print("Попробуй: --horizon 48 --smooth-span 24 --turnover-cap 0.02 --max-dd-cap 0.50")
         return
 
-    def save_common_outputs(stats, el, xl, es, xs, mh, cd, loose_flag=False):
+    def save_common_outputs(stats, params, loose_flag=False):
+        el, xl, es, xs, mh, cd, sl_mult = params
         tag = "LOOSE, cap violated" if loose_flag else "OOF, turnover≤cap & DD≤cap"
         print(f"\n=== Best thresholds ({tag}) ===")
-        print(f"enter_long_q={el}, exit_long_q={xl}, enter_short_q={es}, exit_short_q={xs}, min_hold={mh}, cooldown={cd}")
+        print(f"enter_long_q={el}, exit_long_q={xl}, enter_short_q={es}, exit_short_q={xs}, min_hold={mh}, cooldown={cd}, sl_mult={sl_mult}")
         print("Thresholds:", stats['thresholds'])
         tp_bar = stats['turns']/max(1,stats['n_bars'])
-        print("\n=== Backtest (OOF · hysteresis · open-next) ===")
+        
+        # Считаем CAGR из сырых ретёрнов
+        years = stats['n_bars'] / bpy if stats['n_bars'] > 0 else 0
+        eq = (1.0 + stats['ret']).cumprod()
+        cagr = (eq.iloc[-1] ** (1/years) - 1.0) if years > 0 and not eq.empty else 0.0
+
+        print("\n=== Backtest (OOF · iterative engine) ===")
         print(f"Bars: {stats['n_bars']}, Turns: {stats['turns']}  (avg {tp_bar:.3f} per bar{'' if loose_flag else f', cap={args.turnover_cap}'})")
         print(f"Shares (L/S/F): {stats['long_share']:.2%} / {stats['short_share']:.2%} / {stats['neutral_share']:.2%}")
-        print(f"Sharpe: {stats['sharpe']:.2f}, CAGR: {stats['cagr']:.2%}, MaxDD: {stats['max_dd']:.2%}")
+        print(f"Sharpe: {stats['sharpe']:.2f}, CAGR: {cagr:.2%}, MaxDD: {stats['max_dd']:.2%}")
 
         # График и бенчмарк
-        if args.plot and len(stats['equity']):
+        if args.plot and not eq.empty:
             plt.figure(figsize=(10,5))
-            stats['equity'].plot(label='Strategy')
-            eq_bh = (df_feat['c'].loc[stats['equity'].index] / df_feat['c'].loc[stats['equity'].index][0])
+            eq.plot(label='Strategy')
+            eq_bh = (df_feat['c'].loc[eq.index] / df_feat['c'].loc[eq.index][0])
             eq_bh.plot(label='Buy & Hold')
-            plt.legend(); plt.title(f"Equity (OOF · open-next){' · LOOSE' if loose_flag else ''} {args.symbol} {args.timeframe}")
+            plt.legend(); plt.title(f"Equity (OOF · iterative){' · LOOSE' if loose_flag else ''} {args.symbol} {args.timeframe}")
             plt.grid(True, alpha=0.3); plt.tight_layout(); plt.show()
 
         # Сохранить equity/ret/pos
-        out = pd.DataFrame({'equity': stats['equity'], 'ret': stats['ret'], 'pos': stats['pos']})
+        out = pd.DataFrame({'equity': eq, 'ret': stats['ret'], 'pos': stats['pos']})
         out.to_csv("backtest_oof_results.csv"); print("Saved: backtest_oof_results.csv")
 
         # Сохранить thresholds для live/paper
@@ -732,8 +1009,15 @@ def main():
             "thresholds": stats["thresholds"],
             "min_hold": mh,
             "cooldown": cd,
+            "stop_loss": {"use": sl_mult > 0, "atr_multiplier": sl_mult if sl_mult > 0 else None},
+            "htf_filter": {
+                "use": args.use_htf_filter,
+                "timeframe": args.htf_timeframe,
+                "supertrend_period": args.htf_supertrend_period,
+                "supertrend_multiplier": args.htf_supertrend_multiplier
+            },
             "fees": {"fee_per_side": FEE_PER_SIDE, "slippage_per_side": SLIPPAGE_PER_SIDE},
-            "performance": {"sharpe": stats['sharpe'], "cagr": stats['cagr'], "max_dd": stats['max_dd']},
+            "performance": {"sharpe": stats['sharpe'], "cagr": cagr, "max_dd": stats['max_dd']},
             "turnover_cap_violated": bool(loose_flag)
         }
         with open("best_thresholds.json", "w") as f:
@@ -741,16 +1025,21 @@ def main():
         print("Saved: best_thresholds.json")
 
         # --- Все сделки (CSV + JSON) по open-исполнению ---
-        pos_exec = stats['pos'].shift(1).reindex(df_feat.index).fillna(0).astype(int)
-        trades = extract_trades_from_pos_open(df_feat[['o','c']], pos_exec, FEE_PER_SIDE, SLIPPAGE_PER_SIDE)
+        trades = extract_trades_from_pos_open(stats['pos'], df_feat, FEE_PER_SIDE, SLIPPAGE_PER_SIDE)
         trades.to_csv("trades_all.csv", index=False); print("Saved: trades_all.csv")
         json_path = save_trades_json(trades, "trades_all.json")
         print("Saved:", json_path)
         print("\n=== Trade summary ===")
-        print(summarize_trades(trades, args.timeframe))
+        summary = summarize_trades(trades, args.timeframe)
+        print(f"Всего сделок: {summary['n_trades']}")
+        print(f"Winrate: {summary['winrate']*100:.1f}%")
+        print(f"Profit factor: {summary['profit_factor']:.2f}  |  Expectancy/сделка: {summary['expectancy_pct']:.2f}%")
+        print(f"Средняя длительность: {summary['avg_hold_hours']:.1f} ч")
+        print(f"Серии — побед: {summary['max_win_streak']} | убыточных: {summary['max_loss_streak']}")
+        print(f"Средняя прибыльная: {summary['avg_win_pct']:.2f}%  |  Средняя убыточная: {summary['avg_loss_pct']:.2f}%")
 
         # --- Денежное эквити с депозитами/выводами ---
-        # Собираем ретёрны стратегии в тех же временных точках, где pos_exec определён
+        pos_exec = stats['pos'].shift(1).reindex(df_feat.index).fillna(0).astype(int)
         o = df_feat['o'].reindex(pos_exec.index).astype(float)
         ret_bar = (o.shift(-1) / o - 1.0).dropna()
         pos_e = pos_exec.reindex(ret_bar.index).fillna(0).astype(int)
@@ -781,11 +1070,11 @@ def main():
 
     # Печать/сохранение для лучшего варианта
     if best is not None:
-        (el, xl, es, xs, mh, cd) = best
-        save_common_outputs(best_stats, el, xl, es, xs, mh, cd, loose_flag=False)
+        (el, xl, es, xs, mh, cd, sl_mult) = best
+        save_common_outputs(best_stats, (el, xl, es, xs, mh, cd, sl_mult), loose_flag=False)
     else:
-        (el, xl, es, xs, mh, cd) = best_loose
-        save_common_outputs(best_loose_stats, el, xl, es, xs, mh, cd, loose_flag=True)
+        (el, xl, es, xs, mh, cd, sl_mult) = best_loose
+        save_common_outputs(best_loose_stats, (el, xl, es, xs, mh, cd, sl_mult), loose_flag=True)
 
     # ===== Оценка за последние N дней: калибруем до окна, фикс-пороги в окне
     if args.last_days and args.last_days > 0:
@@ -794,52 +1083,70 @@ def main():
         # 1) Калибровка порогов только по истории ДО окна
         proba_hist = proba_s.loc[proba_s.index <= cutoff]
         feat_hist  = df_feat.loc[df_feat.index <= cutoff]
-        best_hist, stats_hist, best_loose_hist, stats_loose_hist = search_thresholds(
+        trend_filter_hist = trend_filter.loc[trend_filter.index <= cutoff] if trend_filter is not None else None
+        
+        best_hist, stats_hist, best_loose_hist, stats_loose_hist = search_thresholds_and_sl(
             proba_hist, feat_hist, args.timeframe,
+            trend_filter=trend_filter_hist,
             turnover_cap=args.turnover_cap, max_dd_cap=args.max_dd_cap,
             fee_per_side=FEE_PER_SIDE, slippage_per_side=SLIPPAGE_PER_SIDE
         )
         if best_hist is None and best_loose_hist is None:
             print(f"\n[Last {args.last_days}d] Не удалось откалибровать пороги на истории до окна.")
         else:
-            if best_hist is not None:
-                el, xl, es, xs, mh, cd = best_hist
-                th = stats_hist["thresholds"]
-            else:
-                el, xl, es, xs, mh, cd = best_loose_hist
-                th = stats_loose_hist["thresholds"]
+            params_last = best_hist if best_hist is not None else best_loose_hist
+            stats_calib = stats_hist if best_hist is not None else stats_loose_hist
+            el, xl, es, xs, mh, cd, sl_mult = params_last
+            th = stats_calib["thresholds"]
 
             # 2) Тест только в окне (фиксированные thresholds!)
             proba_last = proba_s.loc[proba_s.index > cutoff]
             feat_last  = df_feat.loc[df_feat.index > cutoff]
-            stats_last = backtest_hysteresis_fixed_thresholds_open(
-                feat_last, proba_last, args.timeframe,
-                thresholds=th, min_hold=mh, cooldown=cd,
-                fee_per_side=FEE_PER_SIDE, slippage_per_side=SLIPPAGE_PER_SIDE
+            trend_filter_last = trend_filter.loc[trend_filter.index > cutoff] if trend_filter is not None else None
+
+            stats_last_res = _run_backtest_engine(
+                df=feat_last, proba=proba_last, tf=args.timeframe, thresholds=th,
+                min_hold=mh, cooldown=cd,
+                fee_per_side=FEE_PER_SIDE, slippage_per_side=SLIPPAGE_PER_SIDE,
+                trend_filter=trend_filter_last,
+                use_stop_loss=sl_mult > 0, sl_atr_multiplier=sl_mult
             )
+            ret_last = stats_last_res['ret']
+            pos_last = stats_last_res['pos']
+            
+            # Считаем метрики для окна
+            eq_last = (1.0 + ret_last).cumprod()
+            sharpe_last = (ret_last.mean() / (ret_last.std() + 1e-12)) * np.sqrt(bpy) if not ret_last.empty else 0.0
+            years_last = len(ret_last) / bpy if len(ret_last) > 0 else 0
+            cagr_last = (eq_last.iloc[-1] ** (1/years_last) - 1.0) if years_last > 0 and not eq_last.empty else 0.0
+            mdd_last = max_drawdown(eq_last)
 
             print(f"\n=== Last {args.last_days} days (fixed thresholds from prior history) ===")
-            print(f"Bars: {stats_last['n_bars']}, Turns: {stats_last['turns']}, Shares L/S/F: "
-                  f"{stats_last['long_share']:.1%}/{stats_last['short_share']:.1%}/{stats_last['neutral_share']:.1%}")
-            print(f"Sharpe: {stats_last['sharpe']:.2f}, CAGR: {stats_last['cagr']:.2%}, MaxDD: {stats_last['max_dd']:.2%}")
+            print(f"Bars: {len(ret_last)}, Turns: {pos_last.diff().abs().sum()}, Shares L/S/F: "
+                  f"{(pos_last == 1).mean():.1%}/{(pos_last == -1).mean():.1%}/{(pos_last == 0).mean():.1%}")
+            print(f"Sharpe: {sharpe_last:.2f}, CAGR: {cagr_last:.2%}, MaxDD: {mdd_last:.2%}")
 
             # Сделки последнего окна
-            pos_exec_last = stats_last['pos'].shift(1).reindex(feat_last.index).fillna(0).astype(int)
-            trades_last = extract_trades_from_pos_open(feat_last[['o','c']], pos_exec_last, FEE_PER_SIDE, SLIPPAGE_PER_SIDE)
+            trades_last = extract_trades_from_pos_open(pos_last, feat_last, FEE_PER_SIDE, SLIPPAGE_PER_SIDE)
             trades_last.to_csv("trades_last_window.csv", index=False)
             _ = save_trades_json(trades_last, "trades_last_window.json")
             print("Saved: trades_last_window.csv, trades_last_window.json")
             print("\n--- Trade summary (last window) ---")
-            print(summarize_trades(trades_last, args.timeframe))
-
+            summary_tr_last = summarize_trades(trades_last, args.timeframe)
+            print(f"Всего сделок: {summary_tr_last['n_trades']}")
+            print(f"Winrate: {summary_tr_last['winrate']*100:.1f}%")
+            print(f"Profit factor: {summary_tr_last['profit_factor']:.2f}  |  Expectancy/сделка: {summary_tr_last['expectancy_pct']:.2f}%")
+            print(f"Средняя длительность: {summary_tr_last['avg_hold_hours']:.1f} ч")
+            
             # Денежное эквити за окно
+            pos_exec_last = pos_last.shift(1).reindex(feat_last.index).fillna(0).astype(int)
             o_last = feat_last['o'].reindex(pos_exec_last.index).astype(float)
-            ret_last = (o_last.shift(-1) / o_last - 1.0).dropna()
-            pos_e_last = pos_exec_last.reindex(ret_last.index).fillna(0).astype(int)
+            ret_bar_last = (o_last.shift(-1) / o_last - 1.0).dropna()
+            pos_e_last = pos_exec_last.reindex(ret_bar_last.index).fillna(0).astype(int)
             turns_last = pos_e_last.diff().abs().fillna(0)
             cost_side = float(FEE_PER_SIDE + SLIPPAGE_PER_SIDE)
             costs_last = turns_last * cost_side
-            strat_ret_last = pos_e_last * ret_last - costs_last
+            strat_ret_last = pos_e_last * ret_bar_last - costs_last
 
             cflows = load_cashflows(args.cashflows)
             cflows_on_bars = align_cashflows_to_index(cflows, strat_ret_last.index)
@@ -866,33 +1173,49 @@ def main():
     cut = int(len(proba_s) * 0.8)
     proba_calib, proba_test = proba_s.iloc[:cut], proba_s.iloc[cut:]
     feat_calib, feat_test   = df_feat.iloc[:cut], df_feat.iloc[cut:]
+    trend_filter_calib = trend_filter.loc[trend_filter.index <= proba_calib.index[-1]] if trend_filter is not None else None
+    trend_filter_test = trend_filter.loc[trend_filter.index > proba_calib.index[-1]] if trend_filter is not None else None
 
-    best_cal, stats_cal, *_ = search_thresholds(
+    best_cal, stats_cal, *_ = search_thresholds_and_sl(
         proba_calib, feat_calib, args.timeframe,
+        trend_filter=trend_filter_calib,
         turnover_cap=args.turnover_cap, max_dd_cap=args.max_dd_cap,
         fee_per_side=FEE_PER_SIDE, slippage_per_side=SLIPPAGE_PER_SIDE
     )
     if best_cal is not None:
-        el, xl, es, xs, mh, cd = best_cal
-        stats_oot = backtest_hysteresis_open_next(
-            feat_test, proba_test, args.timeframe,
-            enter_long_q=el, exit_long_q=xl, enter_short_q=es, exit_short_q=xs,
+        el, xl, es, xs, mh, cd, sl_mult = best_cal
+        th_cal = stats_cal['thresholds']
+        
+        stats_oot_res = _run_backtest_engine(
+            df=feat_test, proba=proba_test, tf=args.timeframe, thresholds=th_cal,
             min_hold=mh, cooldown=cd,
-            fee_per_side=FEE_PER_SIDE, slippage_per_side=SLIPPAGE_PER_SIDE
+            fee_per_side=FEE_PER_SIDE, slippage_per_side=SLIPPAGE_PER_SIDE,
+            trend_filter=trend_filter_test,
+            use_stop_loss=sl_mult > 0, sl_atr_multiplier=sl_mult
         )
-        print("\n=== OOT (20%) with fixed thresholds from first 80% (open-next) ===")
-        print(f"Sharpe: {stats_oot['sharpe']:.2f}, CAGR: {stats_oot['cagr']:.2%}, MaxDD: {stats_oot['max_dd']:.2%}, Turns/bar: {stats_oot['turns']/max(1,stats_oot['n_bars']):.3f}")
-        if args.plot and len(stats_oot['equity']):
+        ret_oot = stats_oot_res['ret']
+        pos_oot = stats_oot_res['pos']
+        
+        eq_oot = (1.0 + ret_oot).cumprod()
+        sharpe_oot = (ret_oot.mean() / (ret_oot.std() + 1e-12)) * np.sqrt(bpy) if not ret_oot.empty else 0.0
+        years_oot = len(ret_oot) / bpy if len(ret_oot) > 0 else 0
+        cagr_oot = (eq_oot.iloc[-1] ** (1/years_oot) - 1.0) if years_oot > 0 and not eq_oot.empty else 0.0
+        mdd_oot = max_drawdown(eq_oot)
+        
+        print("\n=== OOT (20%) with fixed thresholds from first 80% (iterative) ===")
+        print(f"Sharpe: {sharpe_oot:.2f}, CAGR: {cagr_oot:.2%}, MaxDD: {mdd_oot:.2%}, Turns/bar: {pos_oot.diff().abs().sum()/max(1,len(pos_oot)):.3f}")
+        
+        if args.plot and not eq_oot.empty:
             plt.figure(figsize=(10,5))
-            stats_oot['equity'].plot(label='Strategy (OOT)')
-            eq_bh = (df_feat['c'].loc[stats_oot['equity'].index] / df_feat['c'].loc[stats_oot['equity'].index][0])
-            eq_bh.plot(label='Buy & Hold')
-            plt.legend(); plt.title("Equity OOT (fixed thresholds, open-next)")
+            eq_oot.plot(label='Strategy (OOT)')
+            eq_bh_oot = (df_feat['c'].loc[eq_oot.index] / df_feat['c'].loc[eq_oot.index][0])
+            eq_bh_oot.plot(label='Buy & Hold')
+            plt.legend(); plt.title("Equity OOT (fixed thresholds, iterative)")
             plt.grid(True, alpha=0.3); plt.tight_layout(); plt.show()
     else:
         print("\nOOT: не удалось найти пороги на калибровочном участке в заданных лимитах.")
 
-    # === Save final model for live inference ===
+    # === Сначала обучаем и сохраняем финальную модель ===
     final_params = dict(
         n_estimators=2000, learning_rate=0.03, num_leaves=63, max_depth=-1,
         min_data_in_leaf=10, min_data_in_bin=1, min_gain_to_split=1e-8,
@@ -908,6 +1231,7 @@ def main():
     print("Saved: final_model_lgbm.pkl")
 
 if __name__ == "__main__":
+    warnings.filterwarnings("ignore", category=FutureWarning)
     # macOS/libomp helper (если lightgbm ругается на libomp: brew install libomp)
     try:
         import platform, subprocess
