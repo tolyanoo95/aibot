@@ -5,14 +5,10 @@ import numpy as np
 import pandas as pd
 import ccxt
 from joblib import load
-import warnings
 
 from ta.momentum import RSIIndicator
-from ta.trend import SMAIndicator, MACD, ADXIndicator
-from ta.volatility import BollingerBands, AverageTrueRange
-from ta.volume import OnBalanceVolumeIndicator
-
-warnings.filterwarnings("ignore", category=FutureWarning)
+from ta.trend import SMAIndicator, MACD
+from ta.volatility import BollingerBands
 
 # ----------------- utils -----------------
 def timeframe_to_minutes(tf: str) -> int:
@@ -25,112 +21,60 @@ def timeframe_to_minutes(tf: str) -> int:
 def timeframe_to_timedelta(tf: str) -> pd.Timedelta:
     return pd.Timedelta(minutes=timeframe_to_minutes(tf))
 
-def fetch_recent_ohlcv(ex, symbol: str, timeframe: str, limit: int = 2000) -> pd.DataFrame:
-    raw = ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-    df = pd.DataFrame(raw, columns=["ts","o","h","l","c","v"])
-    df["ts"] = pd.to_datetime(df["ts"], unit="ms")
-    df = df.drop_duplicates("ts").set_index("ts").sort_index()
-    return df
+def fetch_ohlcv_all(exchange, symbol, timeframe='15m',
+                    since_ms: int | None = None, limit=1000, max_bars=60000):
+    tf2min = timeframe_to_minutes(timeframe)
+    ms_step = tf2min * 60_000
 
-def fetch_ohlcv_all(ex, symbol: str, timeframe: str, max_bars: int = 2000) -> pd.DataFrame:
-    raw = ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=max_bars)
-    df = pd.DataFrame(raw, columns=["ts","o","h","l","c","v"])
+    if since_ms is None:
+        since_ms = int((pd.Timestamp.utcnow()
+                        - pd.Timedelta(minutes=(max_bars + 5) * tf2min)).timestamp() * 1000)
+
+    out, last_ts = [], None
+    while True:
+        chunk = exchange.fetch_ohlcv(symbol, timeframe=timeframe, since=since_ms, limit=limit)
+        if not chunk:
+            break
+        if last_ts is not None and chunk[-1][0] <= last_ts:
+            break
+        out += chunk
+        last_ts = chunk[-1][0]
+        since_ms = last_ts + ms_step
+        if len(out) >= max_bars:
+            out = out[-max_bars:]
+            break
+        time.sleep(exchange.rateLimit / 1000)
+
+    df = pd.DataFrame(out, columns=["ts","o","h","l","c","v"]).drop_duplicates("ts")
     df["ts"] = pd.to_datetime(df["ts"], unit="ms")
     df.set_index("ts", inplace=True)
     return df
 
-def calculate_supertrend(df: pd.DataFrame, atr_period: int = 10, atr_multiplier: float = 3.0) -> tuple[pd.Series, pd.Series]:
-    """Вычисляет Supertrend и возвращает (линия Supertrend, направление тренда True/False)."""
-    df = df.copy()
-    df['h'] = pd.to_numeric(df['h'], errors='coerce')
-    df['l'] = pd.to_numeric(df['l'], errors='coerce')
-    df['c'] = pd.to_numeric(df['c'], errors='coerce')
-    
-    atr = AverageTrueRange(high=df['h'], low=df['l'], close=df['c'], window=atr_period).average_true_range()
-    
-    hl2 = (df['h'] + df['l']) / 2
-    upper_band = hl2 + (atr_multiplier * atr)
-    lower_band = hl2 - (atr_multiplier * atr)
-    
-    in_uptrend = pd.Series(True, index=df.index)
-    supertrend_line = pd.Series(np.nan, index=df.index)
-
-    for i in range(1, len(df)):
-        current = i
-        previous = i - 1
-        
-        if df['c'].iloc[current] > upper_band.iloc[previous]:
-            in_uptrend.iloc[current] = True
-        elif df['c'].iloc[current] < lower_band.iloc[previous]:
-            in_uptrend.iloc[current] = False
-        else:
-            in_uptrend.iloc[current] = in_uptrend.iloc[previous]
-
-        if in_uptrend.iloc[current] and lower_band.iloc[current] < lower_band.iloc[previous]:
-            lower_band.iloc[current] = lower_band.iloc[previous]
-        
-        if not in_uptrend.iloc[current] and upper_band.iloc[current] > upper_band.iloc[previous]:
-            upper_band.iloc[current] = upper_band.iloc[previous]
-
-        if in_uptrend.iloc[current]:
-            supertrend_line.iloc[current] = lower_band.iloc[current]
-        else:
-            supertrend_line.iloc[current] = upper_band.iloc[current]
-            
-    return supertrend_line, in_uptrend
-
-# ----------------------------- Features & Labels -----------------------------
 def build_features(df: pd.DataFrame) -> pd.DataFrame:
     d = df.copy()
-    # base
-    d['ret1']  = d['c'].pct_change(1)
-    d['ret3']  = d['c'].pct_change(3)
-    d['ret5']  = d['c'].pct_change(5)
-    d['ret20'] = d['c'].pct_change(20)
+    d['vol20'] = d['c'].pct_change().rolling(20).std()
+    
+    d['ret1']  = d['c'].pct_change() / d['vol20']
+    d['ret3']  = d['c'].pct_change(3) / d['vol20']
+    d['ret5']  = d['c'].pct_change(5) / d['vol20']
+    d['ret20'] = d['c'].pct_change(20) / d['vol20']
 
-    # --- Убираем RSI, добавляем ADX ---
-    adx_ind = ADXIndicator(high=d['h'], low=d['l'], close=d['c'], window=14)
-    d['adx'] = adx_ind.adx()
-    d['adx_pos'] = adx_ind.adx_pos()
-    d['adx_neg'] = adx_ind.adx_neg()
+    d['rsi'] = RSIIndicator(d['c'], window=14).rsi()
 
     d['sma20'] = SMAIndicator(d['c'], 20).sma_indicator()
-    d['sma50'] = SMAIndicator(d['c'], 50).sma_indicator()
-    
-    # Новый признак на основе Supertrend
-    st_line, _ = calculate_supertrend(d, atr_period=14, atr_multiplier=2.5)
-    d['st_dist'] = (d['c'] / st_line - 1).replace([np.inf, -np.inf], 0)
+    d["sma50"] = SMAIndicator(d["c"], 50).sma_indicator()
+    d["sma_ratio"] = d["sma20"] / d["sma50"] - 1
 
-    # Новый, более робастный признак долгосрочного тренда
-    d['sma200'] = SMAIndicator(d['c'], 200).sma_indicator()
-    d['sma_ratio_long'] = d['sma50'] / d['sma200'] - 1
-    
-    macd = MACD(d['c'])
-    # Нормализуем MACD
-    d['macd_norm']      = macd.macd() / d['sma50']
-    d['macd_sig_norm']  = macd.macd_signal() / d['sma50']
-    d['macd_diff'] = macd.macd_diff()
+    macd = MACD(d["c"])
+    d["macd"]      = macd.macd()
+    d["macd_sig"]  = macd.macd_signal()
+    d["macd_diff"] = macd.macd_diff()
 
-    bb = BollingerBands(d['c'], window=20, window_dev=2.0)
+    bb = BollingerBands(d["c"], window=20, window_dev=2.0)
     rng = (bb.bollinger_hband() - bb.bollinger_lband()).replace(0, np.nan)
-    d['bb_pos'] = (d['c'] - bb.bollinger_mavg()) / rng
+    d["bb_pos"] = (d["c"] - bb.bollinger_mavg()) / rng
 
-    d['vol20'] = d['ret1'].rolling(20).std()
-
-    # --- Признаки на основе объемов ---
-    v_sma50 = d['v'].rolling(50).mean()
-    d['v_sma_ratio'] = (d['v'] / v_sma50 - 1).replace([np.inf, -np.inf], 0)
-    obv = OnBalanceVolumeIndicator(d['c'], d['v']).on_balance_volume()
-    d['obv_momentum'] = obv.pct_change(50).replace([np.inf, -np.inf], 0)
-    
-    # ATR for Stop-Loss
-    atr = AverageTrueRange(high=d['h'], low=d['l'], close=d['c'], window=14)
-    d['atr'] = atr.average_true_range()
-    
-    # Нормализованный ATR для оценки волатильности относительно цены
-    d['atr_norm'] = d['atr'] / d['sma20']
-
-    return d
+    return d.dropna()
 
 def positions_hysteresis_numeric(proba: pd.Series,
                                  enter_long: float, exit_long: float,
@@ -165,17 +109,50 @@ def positions_hysteresis_numeric(proba: pd.Series,
         out.append(state)
     return pd.Series(out, index=proba.index, dtype=int)
 
+def decide_signal(proba_s: pd.Series, params: dict):
+    """
+    Возвращает решение по последнему закрытому бару, ИСПОЛЬЗУЯ РОЛЛИНГ ПОРОГИ.
+    `params` — это весь JSON-файл best_thresholds.json.
+    """
+    quantiles = params["quantiles"]
+    rolling_window = params.get("rolling_window", 1000)
+    min_hold = params.get("min_hold", 24)
+    cooldown = params.get("cooldown", 12)
+    
+    if len(proba_s) < rolling_window:
+        return None # Недостаточно данных для роллинг-окна
 
-def decide_signal(proba_s: pd.Series, thresholds: dict, min_hold: int, cooldown: int):
-    """Возвращает решение по последнему закрытому бару."""
+    # --- Расчет роллинг-порогов ---
+    # Важно: .iloc[:-1] — пороги считаем по истории ДО текущего бара, чтобы избежать lookahead
+    hist_proba = proba_s.iloc[:-1]
+    
+    enter_long_q  = quantiles['enter_long_q']
+    exit_long_q   = quantiles['exit_long_q']
+    enter_short_q = quantiles['enter_short_q']
+    exit_short_q  = quantiles['exit_short_q']
+
+    # Берем последние rolling_window баров из доступной истории
+    relevant_hist = hist_proba.tail(rolling_window)
+    
+    th = {
+        "enter_long":  float(relevant_hist.quantile(enter_long_q)),
+        "exit_long":   float(relevant_hist.quantile(exit_long_q)),
+        "enter_short": float(relevant_hist.quantile(enter_short_q)),
+        "exit_short":  float(relevant_hist.quantile(exit_short_q)),
+    }
+
+    # --- Принятие решения ---
+    # Нам нужны минимум 2 бара (предпоследний и последний), чтобы понять изменение состояния
     pos_raw = positions_hysteresis_numeric(
-        proba_s,
-        thresholds["enter_long"], thresholds["exit_long"],
-        thresholds["enter_short"], thresholds["exit_short"],
+        proba_s.tail(2),
+        th["enter_long"], th["exit_long"],
+        th["enter_short"], th["exit_short"],
         min_hold=min_hold, cooldown=cooldown
     )
+    
     if len(pos_raw) < 2:
         return None
+        
     prev_state = int(pos_raw.iloc[-2])
     next_state = int(pos_raw.iloc[-1])
 
@@ -193,38 +170,25 @@ def decide_signal(proba_s: pd.Series, thresholds: dict, min_hold: int, cooldown:
         next_state=next_state,
         action=action,
         proba=float(proba_s.iloc[-1]),
-        bar_open_ts=proba_s.index[-1]   # время ОТКРЫТИЯ бара-решения
+        bar_open_ts=proba_s.index[-1],
+        thresholds=th # Возвращаем рассчитанные пороги для логгирования
     )
 
 # ----------------- pretty print -----------------
 def print_every_bar(sig: dict, symbol: str, decision_ts: pd.Timestamp,
-                    decision_price: float, planned_exec_ts: pd.Timestamp,
-                    current_pos: int, sl_price: float | None = None, htf_status: str = "OFF"):
+                    decision_price: float, planned_exec_ts: pd.Timestamp):
     """Печатает решение на каждом закрытом баре."""
     action = sig["action"]
-    
-    pos_map = {1: "LONG", -1: "SHORT", 0: "FLAT"}
-    
-    if action == "EXIT_BY_SL":
-        side = "LONG" if current_pos == 1 else "SHORT"
-        print(f"!!! STOP-LOSS: ВЫХОД ИЗ {side} по {sl_price:.8f} @ {decision_ts} — {symbol}")
-    elif action in ("ENTER_LONG", "ENTER_SHORT"):
-        htf_info = f", HTF={htf_status}"
+    if action in ("ENTER_LONG", "ENTER_SHORT"):
         print(f"АЛГОРИТМ ПРИНЯЛ РЕШЕНИЕ: {('ВОЙТИ LONG' if action=='ENTER_LONG' else 'ВОЙТИ SHORT')} "
-              f"(proba={sig['proba']:.4f}{htf_info}) "
               f"по {decision_price:.8f} @ {decision_ts}  — {symbol}")
     else:
         # Информативная строка, когда входа нет
-        human = {"HOLD_LONG":"ДЕРЖАТЬ LONG", "HOLD_SHORT":"ДЕРЖАТЬ SHORT", 
-                 "STAY_FLAT":"БЕЗ ДЕЙСТВИЙ", "EXIT_TO_FLAT":"ВЫЙТИ В НОЛЬ"}
-        sl_info = f", SL={sl_price:.8f}" if sl_price is not None and not np.isnan(sl_price) else ", SL=nan"
-        htf_info = f", HTF={htf_status}"
-        print(f"РЕШЕНИЕ: {human.get(action, action)} (pos={pos_map[sig['next_state']]}{htf_info}{sl_info}, "
-              f"proba={sig['proba']:.4f}) @ {decision_ts}  — {symbol} - {decision_price:.8f}")
-        
+        human = {"HOLD_LONG":"ДЕРЖАТЬ LONG", "HOLD_SHORT":"ДЕРЖАТЬ SHORT", "STAY_FLAT":"БЕЗ ДЕЙСТВИЙ", "EXIT_TO_FLAT":"ВЫЙТИ В НОЛЬ"}
+        print(f"РЕШЕНИЕ: {human.get(action, action)} "
+              f"(proba={sig['proba']:.4f}) @ {decision_ts}  — {symbol} - {decision_price:.8f}")
     # Всегда показываем, когда планируется исполнение
-    if action != "EXIT_BY_SL":
-        print(f"  Плановое исполнение: {planned_exec_ts} (open следующего бара)")
+    print(f"  Плановое исполнение: {planned_exec_ts} (open следующего бара)")
     sys.stdout.flush()
 
 # ----------------- JSONL logging -----------------
@@ -234,344 +198,125 @@ def append_jsonl(path: str, obj: dict):
     with open(path, "a", encoding="utf-8") as f:
         f.write(json.dumps(obj, ensure_ascii=False) + "\n")
 
-# ----------------- State & Main Logic -----------------
-class LiveTrader:
-    def __init__(self, config):
-        self.config = config
-        self.load_settings()
-        self.ex = ccxt.binance(); self.ex.enableRateLimit = True
-        
-        # State
-        self.current_pos = 0 # -1, 0, 1
-        self.entry_price = np.nan
-        self.sl_price = np.nan
-        # Для Trailing SL
-        self.peak_since_entry = np.nan
-        self.trough_since_entry = np.nan
-        self.last_seen_bar_open = None
-        self.pending_exec = None
-        # Новые флаги для блокировки после SL
-        self.sl_cooldown_long = False
-        self.sl_cooldown_short = False
-
-    def load_settings(self):
-        if not os.path.exists(self.config["model"]):
-            print(f"Model file not found: {self.config["model"]}\n→ сначала запусти aibot.py")
-            sys.exit(1)
-        if not os.path.exists(self.config["thresholds"]):
-            print(f"Thresholds file not found: {self.config["thresholds"]}\n→ сначала запусти aibot.py")
-            sys.exit(1)
-
-        th_all = json.load(open(self.config["thresholds"], "r"))
-        self.thresholds = th_all["thresholds"]
-        self.min_hold = int(th_all.get("min_hold", 24))
-        self.cooldown = int(th_all.get("cooldown", 12))
-        self.smooth_span = int(th_all.get("smooth_span", 12))
-        self.symbol = self.config.get("symbol") or th_all.get("symbol")
-        self.timeframe = self.config.get("timeframe") or th_all.get("timeframe")
-        
-        # --- Stop-Loss: приоритет [CLI флаг -> JSON -> дефолт] ---
-        sl_settings = th_all.get("stop_loss", {})
-        # Сначала читаем из JSON, это база
-        self.use_stop_loss = sl_settings.get("use", False)
-        # Если в CLI был передан флаг --disable-stop-loss, он станет False. Если нет - останется True из set_defaults
-        # Этот флаг должен переопределить значение из JSON.
-        if self.config["use_stop_loss"] is not None and self.config["use_stop_loss"] != sl_settings.get("use"):
-             self.use_stop_loss = self.config["use_stop_loss"]
-
-        # Аналогично для multiplier: CLI имеет приоритет
-        cli_sl_mult = self.config.get("sl_atr_multiplier")
-        if cli_sl_mult is not None:
-            self.sl_atr_multiplier = cli_sl_mult
-        else:
-            self.sl_atr_multiplier = sl_settings.get("atr_multiplier", 2.5)
-        
-        # --- HTF Filter ---
-        htf_settings = th_all.get("htf_filter", {})
-        self.use_htf_filter = htf_settings.get("use", True) # По умолчанию ВКЛ
-        if self.config["use_htf_filter"] is not None:
-            self.use_htf_filter = self.config["use_htf_filter"]
-
-        self.htf_timeframe = htf_settings.get("timeframe", "4h")
-        self.htf_period = htf_settings.get("supertrend_period", 14)
-        self.htf_multiplier = htf_settings.get("supertrend_multiplier", 2.5)
-        if self.config.get("htf_timeframe"):
-             self.htf_timeframe = self.config["htf_timeframe"]
-
-        pack = load(self.config["model"])
-        self.model = pack["model"]
-        # Используем финальный набор признаков
-        self.feat_cols = [
-            # Сила и направление тренда
-            'adx', 'adx_pos', 'adx_neg',
-            # Подтверждение объемом
-            'v_sma_ratio', 'obv_momentum',
-            # Долгосрочное направление и моментум
-            'sma_ratio_long', 'macd_norm', 'macd_sig_norm',
-            # Положение относительно тренда
-            'st_dist',
-            # Волатильность
-            'vol20', 'atr_norm'
-        ]
-        print(f"Settings loaded for {self.symbol} {self.timeframe}. SL_ATR={self.sl_atr_multiplier if self.use_stop_loss else 'OFF'}, HTF={self.htf_timeframe if self.use_htf_filter else 'OFF'}")
-
-    def run_once(self):
-        # --- Data Fetching ---
-        df = fetch_recent_ohlcv(self.ex, self.symbol, self.timeframe, limit=max(600, self.config["history_bars"]))
-        if len(df) < 200:
-            print(f"Not enough bars ({len(df)})"); return
-
-        # --- Feature & Proba Calculation ---
-        feat = build_features(df)
-        
-        # --- HTF Filter Calculation ---
-        trend_is_up = None # True-up, False-down, None-не используется
-        htf_status = "OFF"
-        if self.use_htf_filter:
-            df_htf = fetch_ohlcv_all(self.ex, self.symbol, self.htf_timeframe, max_bars=500)
-            _, htf_trend_up = calculate_supertrend(df_htf, self.htf_period, self.htf_multiplier)
-            if not htf_trend_up.empty:
-                trend_is_up = htf_trend_up.iloc[-1]
-                htf_status = "UP" if trend_is_up else "DOWN"
-
-        # --- Execution Confirmation ---
-        if self.pending_exec is not None:
-            planned_ts = self.pending_exec["planned_ts"]
-            if planned_ts in df.index:
-                executed_price = float(df.loc[planned_ts, "o"])
-                print(f">>> ИСПОЛНЕНО: {self.pending_exec['action']} по {executed_price:.8f} @ {planned_ts} (open)")
-                
-                if self.pending_exec['action'] in ("ENTER_LONG", "ENTER_SHORT"):
-                    self.current_pos = 1 if self.pending_exec['action'] == "ENTER_LONG" else -1
-                    self.entry_price = executed_price
-                    # Set SL based on the ATR of the *decision* bar
-                    if self.use_stop_loss:
-                        atr_val = self.pending_exec.get('atr_on_decision')
-                        if atr_val is not None and not np.isnan(atr_val):
-                            if self.current_pos == 1:
-                                self.sl_price = self.entry_price - self.sl_atr_multiplier * atr_val
-                                self.peak_since_entry = self.entry_price # Инициализация пика
-                            else:
-                                self.sl_price = self.entry_price + self.sl_atr_multiplier * atr_val
-                                self.trough_since_entry = self.entry_price # Инициализация впадины
-                        else:
-                            print("WARNING: ATR value is invalid, cannot set Stop-Loss for this entry.")
-                            self.sl_price = np.nan
-
-                else: # EXIT
-                    self.current_pos = 0
-                    self.entry_price, self.sl_price = np.nan, np.nan
-                    self.peak_since_entry, self.trough_since_entry = np.nan, np.nan # Сброс
-                self.pending_exec = None
-
-        # --- Stop-Loss Check (on previous, now-closed bar) ---
-        sl_exit_action = None
-        if self.current_pos != 0 and self.use_stop_loss and not np.isnan(self.sl_price):
-            last_closed_bar = df.iloc[-1] # FIX: Проверяем последнюю закрытую свечу, а не предпоследнюю
-            
-            # Сначала обновляем Trailing Stop
-            # ATR для трейлинга берем с *текущего* бара, чтобы он был адаптивным
-            current_atr = build_features(df)['atr'].iloc[-1]
-            if self.current_pos == 1:
-                self.peak_since_entry = max(self.peak_since_entry, last_closed_bar['h'])
-                new_sl = self.peak_since_entry - self.sl_atr_multiplier * current_atr
-                self.sl_price = max(self.sl_price, new_sl)
-            elif self.current_pos == -1:
-                self.trough_since_entry = min(self.trough_since_entry, last_closed_bar['l'])
-                new_sl = self.trough_since_entry + self.sl_atr_multiplier * current_atr
-                self.sl_price = min(self.sl_price, new_sl)
-
-            # Теперь проверяем срабатывание
-            sl_hit = False
-            if self.current_pos == 1 and last_closed_bar['l'] <= self.sl_price:
-                sl_hit = True
-            elif self.current_pos == -1 and last_closed_bar['h'] >= self.sl_price:
-                sl_hit = True
-            
-            if sl_hit:
-                # Immediate exit, no waiting for next bar open
-                tf_delta = timeframe_to_timedelta(self.timeframe)
-                decision_ts = last_closed_bar.name + tf_delta
-                sig = {"action": "EXIT_BY_SL", "proba": np.nan, "next_state": 0}
-                print_every_bar(sig, self.symbol, decision_ts, last_closed_bar['c'], None, self.current_pos, self.sl_price, htf_status=htf_status)
-                
-                # Log and reset state
-                self.log_decision(sig, decision_ts, last_closed_bar.name, last_closed_bar['c'], None)
-                
-                # Включаем флаг блокировки
-                if self.current_pos == 1:
-                    self.sl_cooldown_long = True
-                else: # pos == -1
-                    self.sl_cooldown_short = True
-                
-                self.current_pos = 0
-                self.entry_price, self.sl_price = np.nan, np.nan
-                self.peak_since_entry, self.trough_since_entry = np.nan, np.nan # Сброс
-                self.last_seen_bar_open = df.index[-1] # Skip normal signal on this bar
-                sl_exit_action = sig['action']
-
-        # --- Feature & Proba Calculation ---
-        feat = build_features(df)
-        X = feat[self.feat_cols].shift(1).dropna()
-        if len(X) < 50: return
-        proba = pd.Series(self.model.predict_proba(X)[:, 1], index=X.index)
-        proba_s = proba.ewm(span=self.smooth_span, adjust=False).mean() if self.smooth_span and self.smooth_span > 1 else proba
-
-        # --- New Bar Check ---
-        current_bar_open = proba_s.index[-1]
-        if self.last_seen_bar_open is not None and current_bar_open == self.last_seen_bar_open:
-            return
-
-        # Если мы только что вышли по SL, то на этом баре больше ничего не делаем
-        if sl_exit_action == "EXIT_BY_SL":
-            return
-
-        # --- Signal Decision ---
-        sig = decide_signal(proba_s, self.thresholds, self.min_hold, self.cooldown)
-        if not sig: return
-        
-        # 0. Сброс блокировки, если proba вернулась в "безопасную" зону
-        current_proba = sig['proba']
-        if self.sl_cooldown_long and current_proba < self.thresholds['exit_long']:
-            self.sl_cooldown_long = False
-            print("INFO: Блокировка LONG снята (proba < exit_long)")
-        if self.sl_cooldown_short and current_proba > self.thresholds['exit_short']:
-            self.sl_cooldown_short = False
-            print("INFO: Блокировка SHORT снята (proba > exit_short)")
-            
-        # --- ШАГ 1: Применяем все фильтры к "теоретическому" сигналу ---
-        # 1.1 HTF Filter
-        if self.use_htf_filter and trend_is_up is not None:
-            # Если HTF=UP, запрещаем любые шорты (вход и удержание)
-            if trend_is_up and sig['next_state'] == -1:
-                print(f"HTF filter blocks SHORT signal (HTF trend is UP)")
-                sig['action'] = "STAY_FLAT"; sig['next_state'] = 0
-            # Если HTF=DOWN, запрещаем любые лонги
-            elif not trend_is_up and sig['next_state'] == 1:
-                print(f"HTF filter blocks LONG signal (HTF trend is DOWN)")
-                sig['action'] = "STAY_FLAT"; sig['next_state'] = 0
-        
-        # 1.2 SL Cooldown Filter
-        if self.sl_cooldown_long and sig['action'] == "ENTER_LONG":
-            print(f"SL Cooldown блокирует вход в LONG")
-            sig['action'] = "STAY_FLAT"; sig['next_state'] = 0
-        if self.sl_cooldown_short and sig['action'] == "ENTER_SHORT":
-            print(f"SL Cooldown блокирует вход в SHORT")
-            sig['action'] = "STAY_FLAT"; sig['next_state'] = 0
-
-        # We can't act on a signal if we are already pending an action
-        if self.pending_exec is not None:
-            return
-
-        # --- ШАГ 2: Сверяем отфильтрованный сигнал с РЕАЛЬНЫМ состоянием ---
-        if sig['next_state'] != self.current_pos and self.current_pos != 0:
-            print(f"INFO: Расхождение состояний. Модель -> {sig['next_state']}, Реальная -> {self.current_pos}. Принудительный выход.")
-            sig['action'] = 'EXIT_TO_FLAT'
-            sig['next_state'] = 0
-
-        # Конвертируем "теоретический" сигнал в реальное действие
-        if sig['action'] in ("ENTER_LONG", "ENTER_SHORT") and self.current_pos != 0:
-            sig['action'] = "HOLD_LONG" if self.current_pos == 1 else "HOLD_SHORT"
-            sig['next_state'] = self.current_pos
-        elif sig['action'] == "EXIT_TO_FLAT" and self.current_pos == 0:
-            sig['action'] = "STAY_FLAT"
-            sig['next_state'] = 0
-        elif sig['action'] == 'HOLD_LONG' and self.current_pos == 0:
-            sig['action'] = 'ENTER_LONG'
-        elif sig['action'] == 'HOLD_SHORT' and self.current_pos == 0:
-            sig['action'] = 'ENTER_SHORT'
-
-        tf_delta = timeframe_to_timedelta(self.timeframe)
-        decision_bar_open_ts = sig["bar_open_ts"]
-        decision_ts = decision_bar_open_ts + tf_delta
-        planned_exec_ts = decision_ts
-        decision_price = float(df["c"].reindex(proba_s.index).iloc[-1])
-        
-        print_every_bar(sig, self.symbol, decision_ts, decision_price, planned_exec_ts, self.current_pos, self.sl_price, htf_status=htf_status)
-        
-        self.log_decision(sig, decision_ts, decision_bar_open_ts, decision_price, planned_exec_ts)
-
-        if sig["action"] in ("ENTER_LONG", "ENTER_SHORT", "EXIT_TO_FLAT"):
-            atr_on_decision = feat['atr'].reindex(proba_s.index).iloc[-1]
-            self.pending_exec = {
-                "action": sig["action"], 
-                "planned_ts": pd.Timestamp(planned_exec_ts),
-                "atr_on_decision": atr_on_decision
-            }
-
-        self.last_seen_bar_open = current_bar_open
-
-    def log_decision(self, sig, decision_ts, decision_bar_open_ts, decision_price, planned_exec_ts):
-        log_rec = {
-            "symbol": self.symbol, "timeframe": self.timeframe,
-            "decision_ts": str(decision_ts),
-            "decision_bar_open_ts": str(decision_bar_open_ts),
-            "decision_price": decision_price,
-            "proba": sig.get("proba"), "action": sig["action"],
-            "current_pos_before": self.current_pos,
-            "next_state_model": sig.get("next_state"),
-            "planned_exec_ts": str(planned_exec_ts) if planned_exec_ts else None,
-            "sl_price_before": self.sl_price
-        }
-        append_jsonl(self.config["log"], log_rec)
-        if sig["action"] in ("ENTER_LONG", "ENTER_SHORT"):
-            append_jsonl(self.config["entries_log"], log_rec)
-
 # ----------------- main -----------------
 def main():
     ap = argparse.ArgumentParser(description="Live decisions printer (каждый закрытый бар; входы показываются явно)")
     ap.add_argument("--model", default="final_model_lgbm.pkl", help="model file from aibot.py")
     ap.add_argument("--thresholds", default="best_thresholds.json", help="thresholds file from aibot.py")
-    ap.add_argument("--symbol", type=str, default="SOL/USDT", help="Symbol to trade")
-    ap.add_argument("--timeframe", type=str, default="15m", help="Trading timeframe")
-    
-    # HTF Filter (CLI override)
-    ap.add_argument("--disable-htf-filter", dest="use_htf_filter", action="store_false", help="Отключить фильтр Supertrend на старшем таймфрейме")
-    ap.add_argument("--enable-htf-filter", dest="use_htf_filter", action="store_true", help="Принудительно включить фильтр Supertrend")
-    ap.set_defaults(use_htf_filter=None) 
-    ap.add_argument("--htf-timeframe", type=str, default=None, help="Переопределить таймфрейм для HTF Supertrend фильтра")
-
-    # Stop-Loss
-    ap.add_argument("--disable-stop-loss", dest="use_stop_loss", action="store_false", help="Отключить динамический стоп-лосс по ATR")
-    ap.add_argument("--enable-stop-loss", dest="use_stop_loss", action="store_true", help="Принудительно включить стоп-лосс")
-    ap.set_defaults(use_stop_loss=None) # Убираем дефолт
-    ap.add_argument("--sl-atr-multiplier", type=float, default=None, help="Переопределить множитель ATR для стоп-лосса")
-    
-    # Добавляем недостающие аргументы для консистентности
-    ap.add_argument("--history-bars", type=int, default=500, help="bars for context & smoothing")
+    ap.add_argument("--symbol", default=None, help="override symbol (else from thresholds.json)")
+    ap.add_argument("--timeframe", default=None, help="override timeframe (else from thresholds.json)")
+    ap.add_argument("--history-bars", type=int, default=5000, help="bars for context & smoothing")
     ap.add_argument("--loop", action="store_true", help="run forever")
     ap.add_argument("--sleep", type=int, default=30, help="polling sleep seconds in loop mode")
     ap.add_argument("--log", default=None, help="JSONL файл с решениями каждого бара")
     ap.add_argument("--entries-log", default=None, help="JSONL файл только с входами (ENTER_LONG/ENTER_SHORT)")
-
     args = ap.parse_args()
 
-    # Собираем конфиг из файлов и аргументов
-    config = {
-        "model": args.model,
-        "thresholds": args.thresholds,
-        "symbol": args.symbol,
-        "timeframe": args.timeframe,
-        "history_bars": args.history_bars,
-        "log": args.log,
-        "entries_log": args.entries_log,
-        "use_stop_loss": args.use_stop_loss,
-        "sl_atr_multiplier": args.sl_atr_multiplier,
-        "use_htf_filter": args.use_htf_filter,
-        "htf_timeframe": args.htf_timeframe,
-    }
+    # файлы
+    if not os.path.exists(args.model):
+        print(f"Model file not found: {args.model}\n→ сначала запусти aibot.py, чтобы создать final_model_lgbm.pkl")
+        sys.exit(1)
+    if not os.path.exists(args.thresholds):
+        print(f"Thresholds file not found: {args.thresholds}\n→ сначала запусти aibot.py, чтобы создать best_thresholds.json")
+        sys.exit(1)
 
-    trader = LiveTrader(config)
-    
+    # пороги/параметры
+    th_all = json.load(open(args.thresholds, "r"))
+    quantiles = th_all["quantiles"]
+    rolling_window = th_all.get("rolling_window", 1000)
+    min_hold = int(th_all.get("min_hold", 24))
+    cooldown = int(th_all.get("cooldown", 12))
+    smooth_span = int(th_all.get("smooth_span", 12))
+    symbol = args.symbol or th_all.get("symbol", "XRP/USDT")
+    timeframe = args.timeframe or th_all.get("timeframe", "15m")
+
+    # модель
+    pack = load(args.model)
+    model = pack["model"]
+    feat_cols = pack.get("feat_cols", ['ret1','ret3','ret5','ret20','rsi','sma_ratio','macd','macd_sig','macd_diff','bb_pos','vol20'])
+
+    # биржа
+    ex = ccxt.binance(); ex.enableRateLimit = True
+
+    last_seen_bar_open = None
+    pending_exec = None  # {'action': ..., 'planned_ts': Timestamp}
+
+    def once():
+        nonlocal last_seen_bar_open, pending_exec
+
+        # данные
+        bars_needed = max(rolling_window + 200, args.history_bars)
+        df = fetch_ohlcv_all(ex, symbol, timeframe, max_bars=bars_needed)
+        if len(df) < rolling_window:
+            print(f"Not enough bars ({len(df)}) for rolling window ({rolling_window})"); return
+
+        # подтвердить исполнение, если наступил следующий бар
+        if pending_exec is not None:
+            planned_ts = pending_exec["planned_ts"]
+            if planned_ts in df.index:
+                executed_price = float(df.loc[planned_ts, "o"])
+                print(f">>> ИСПОЛНЕНО: {pending_exec['action']} по {executed_price:.8f} @ {planned_ts} (open)")
+                pending_exec = None
+
+        # фичи и вероятность
+        feat = build_features(df)
+        X = feat[feat_cols].shift(1).dropna()
+        if len(X) < 50: return
+        proba = pd.Series(model.predict_proba(X)[:, 1], index=X.index)
+        proba_s = proba.ewm(span=smooth_span, adjust=False).mean() if smooth_span and smooth_span > 1 else proba
+
+        # работаем только по новому закрытому бару
+        current_bar_open = proba_s.index[-1]
+        if last_seen_bar_open is not None and current_bar_open == last_seen_bar_open:
+            return
+
+        # решение
+        sig = decide_signal(proba_s, th_all)
+        if not sig: return
+
+        tf_delta = timeframe_to_timedelta(timeframe)
+        decision_bar_open_ts = sig["bar_open_ts"]
+        decision_ts = decision_bar_open_ts + tf_delta                 # время закрытия текущего бара
+        planned_exec_ts = decision_ts                                 # open следующего бара
+        decision_price = float(df["c"].reindex(proba_s.index).iloc[-1])  # close текущего бара
+
+        # печать — НА КАЖДОМ БАРЕ
+        print_every_bar(sig, symbol, decision_ts, decision_price, planned_exec_ts)
+
+        # лог JSONL (все решения)
+        all_rec = {
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "decision_ts": str(decision_ts),
+            "decision_bar_open_ts": str(decision_bar_open_ts),
+            "decision_price": decision_price,
+            "proba": sig["proba"],
+            "action": sig["action"],
+            "prev_state": sig["prev_state"],
+            "next_state": sig["next_state"],
+            "planned_exec_ts": str(planned_exec_ts),
+            "thresholds": sig["thresholds"],
+            "smooth_span": smooth_span
+        }
+        append_jsonl(args.log, all_rec)
+
+        # если вход — отдельная запись и план подтверждения
+        if sig["action"] in ("ENTER_LONG", "ENTER_SHORT"):
+            append_jsonl(args.entries_log, all_rec)
+            pending_exec = {"action": sig["action"], "planned_ts": pd.Timestamp(planned_exec_ts)}
+
+        last_seen_bar_open = current_bar_open
+
     # one-shot
     if not args.loop:
-        trader.run_once(); return
+        once(); return
 
-    # loop
-    print(f"Started loop: symbol={trader.symbol}, timeframe={trader.timeframe}")
+    # loop python3 live_signal.py --loop --sleep 300
+    print(f"Started loop: symbol={symbol}, timeframe={timeframe}, smooth_span={smooth_span}, "
+          f"min_hold={min_hold}, cooldown={cooldown}")
     while True:
         try:
-            trader.run_once()
+            once()
         except Exception as e:
             print("ERROR:", repr(e))
         time.sleep(args.sleep)
