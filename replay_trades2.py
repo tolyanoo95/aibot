@@ -57,10 +57,12 @@ def fetch_ohlcv_all(exchange, symbol, timeframe='15m',
 
 def build_features(df: pd.DataFrame) -> pd.DataFrame:
     d = df.copy()
-    d["ret1"]  = d["c"].pct_change()
-    d["ret3"]  = d["c"].pct_change(3)
-    d["ret5"]  = d["c"].pct_change(5)
-    d["ret20"] = d["c"].pct_change(20)
+    d['vol20'] = d['c'].pct_change().rolling(20).std()
+    
+    d['ret1']  = d['c'].pct_change() / d['vol20']
+    d['ret3']  = d['c'].pct_change(3) / d['vol20']
+    d['ret5']  = d['c'].pct_change(5) / d['vol20']
+    d['ret20'] = d['c'].pct_change(20) / d['vol20']
 
     d["rsi"] = RSIIndicator(d["c"], window=14).rsi()
 
@@ -77,41 +79,61 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     rng = (bb.bollinger_hband() - bb.bollinger_lband()).replace(0, np.nan)
     d["bb_pos"] = (d["c"] - bb.bollinger_mavg()) / rng
 
-    d["vol20"] = d["ret1"].rolling(20).std()
     return d.dropna()
 
-def positions_hysteresis_numeric(proba: pd.Series,
-                                 enter_long: float, exit_long: float,
-                                 enter_short: float, exit_short: float,
-                                 min_hold: int, cooldown: int) -> pd.Series:
+def positions_hysteresis_rolling(proba: pd.Series,
+                                 enter_long_q: float, exit_long_q: float,
+                                 enter_short_q: float, exit_short_q: float,
+                                 min_hold: int, cooldown: int,
+                                 rolling_window: int) -> pd.Series:
+    """Генерирует позиции с роллинг-порогами по квантилям."""
     state, hold, cd = 0, 0, 0
-    out = []
-    for p in proba.values:
+    pos = []
+
+    min_p = max(1, int(rolling_window * 0.8))
+    enter_long_s  = proba.rolling(rolling_window, min_periods=min_p).quantile(enter_long_q).shift(1)
+    exit_long_s   = proba.rolling(rolling_window, min_periods=min_p).quantile(exit_long_q).shift(1)
+    enter_short_s = proba.rolling(rolling_window, min_periods=min_p).quantile(enter_short_q).shift(1)
+    exit_short_s  = proba.rolling(rolling_window, min_periods=min_p).quantile(exit_short_q).shift(1)
+    
+    df_merged = pd.concat([proba, enter_long_s, exit_long_s, enter_short_s, exit_short_s], axis=1)
+    df_merged.columns = ['p', 'el', 'xl', 'es', 'xs']
+    df_merged = df_merged.dropna()
+
+    _p = df_merged['p'].values
+    _el = df_merged['el'].values
+    _xl = df_merged['xl'].values
+    _es = df_merged['es'].values
+    _xs = df_merged['xs'].values
+
+    for i in range(len(df_merged)):
+        p, el, xl, es, xs = _p[i], _el[i], _xl[i], _es[i], _xs[i]
         if cd > 0:
             if state != 0:
                 hold += 1
-                if state == 1 and hold >= min_hold and p < exit_long:
+                if state == 1 and hold >= min_hold and p < xl:
                     state, hold, cd = 0, 0, cooldown
-                elif state == -1 and hold >= min_hold and p > exit_short:
+                elif state == -1 and hold >= min_hold and p > xs:
                     state, hold, cd = 0, 0, cooldown
             else:
                 cd -= 1
         else:
             if state == 0:
-                if p > enter_long:
+                if p > el:
                     state, hold = 1, 0
-                elif p < enter_short:
+                elif p < es:
                     state, hold = -1, 0
             elif state == 1:
                 hold += 1
-                if hold >= min_hold and p < exit_long:
+                if hold >= min_hold and p < xl:
                     state, hold, cd = 0, 0, cooldown
             elif state == -1:
                 hold += 1
-                if hold >= min_hold and p > exit_short:
+                if hold >= min_hold and p > xs:
                     state, hold, cd = 0, 0, cooldown
-        out.append(state)
-    return pd.Series(out, index=proba.index, dtype=int)
+        pos.append(state)
+    return pd.Series(pos, index=df_merged.index, dtype=int)
+
 
 def extract_trades_from_pos(prices: pd.Series, pos_exec: pd.Series,
                             fee_per_side=FEE_PER_SIDE_DEFAULT, slippage_per_side=SLIP_PER_SIDE_DEFAULT) -> pd.DataFrame:
@@ -286,9 +308,10 @@ def main():
 
     # читаем пороги/параметры
     th_all = json.load(open(args.thresholds, "r"))
-    th = th_all["thresholds"]
-    min_hold = int(th_all.get("min_hold", th_all.get("params", {}).get("min_hold", 24)))
-    cooldown = int(th_all.get("cooldown", th_all.get("params", {}).get("cooldown", 12)))
+    quantiles = th_all["quantiles"]
+    rolling_window = th_all.get("rolling_window", 1000)
+    min_hold = int(th_all.get("min_hold", 24))
+    cooldown = int(th_all.get("cooldown", 12))
     fee_side = float(th_all.get("fees", {}).get("fee_per_side", FEE_PER_SIDE_DEFAULT))
     slip_side = float(th_all.get("fees", {}).get("slippage_per_side", SLIP_PER_SIDE_DEFAULT))
     symbol = args.symbol or th_all.get("symbol", DEFAULT_SYMBOL)
@@ -306,8 +329,8 @@ def main():
     print(f"Downloading: {symbol} {timeframe} (max {args.max_bars} bars)")
     df = fetch_ohlcv_all(ex, symbol, timeframe=timeframe, max_bars=args.max_bars)
     df = df.rename(columns=str.lower)
-    if len(df) < 300:
-        print(f"Слишком мало баров: {len(df)}"); sys.exit(1)
+    if len(df) < rolling_window + 100:
+        print(f"Слишком мало баров: {len(df)} (нужно > {rolling_window + 100})"); sys.exit(1)
 
     # фичи и X (shift(1) против утечек)
     feat = build_features(df)
@@ -319,9 +342,11 @@ def main():
     proba_s = proba.ewm(span=int(smooth_span), adjust=False).mean() if smooth_span and smooth_span > 1 else proba
 
     # позиции и сделки
-    pos_raw = positions_hysteresis_numeric(
-        proba_s, th["enter_long"], th["exit_long"], th["enter_short"], th["exit_short"],
-        min_hold=min_hold, cooldown=cooldown
+    pos_raw = positions_hysteresis_rolling(
+        proba_s, 
+        quantiles['enter_long_q'], quantiles['exit_long_q'],
+        quantiles['enter_short_q'], quantiles['exit_short_q'],
+        min_hold=min_hold, cooldown=cooldown, rolling_window=rolling_window
     )
     pos_exec = pos_raw.shift(1).reindex(prices.index).fillna(0).astype(int)
     trades = extract_trades_from_pos(prices, pos_exec, fee_per_side=fee_side, slippage_per_side=slip_side)
