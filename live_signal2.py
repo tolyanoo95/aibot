@@ -21,23 +21,47 @@ def timeframe_to_minutes(tf: str) -> int:
 def timeframe_to_timedelta(tf: str) -> pd.Timedelta:
     return pd.Timedelta(minutes=timeframe_to_minutes(tf))
 
-def fetch_recent_ohlcv(ex, symbol: str, timeframe: str, limit: int = 2000) -> pd.DataFrame:
-    raw = ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-    df = pd.DataFrame(raw, columns=["ts","o","h","l","c","v"])
+def fetch_ohlcv_all(exchange, symbol, timeframe='15m',
+                    since_ms: int | None = None, limit=1000, max_bars=60000):
+    tf2min = timeframe_to_minutes(timeframe)
+    ms_step = tf2min * 60_000
+
+    if since_ms is None:
+        since_ms = int((pd.Timestamp.utcnow()
+                        - pd.Timedelta(minutes=(max_bars + 5) * tf2min)).timestamp() * 1000)
+
+    out, last_ts = [], None
+    while True:
+        chunk = exchange.fetch_ohlcv(symbol, timeframe=timeframe, since=since_ms, limit=limit)
+        if not chunk:
+            break
+        if last_ts is not None and chunk[-1][0] <= last_ts:
+            break
+        out += chunk
+        last_ts = chunk[-1][0]
+        since_ms = last_ts + ms_step
+        if len(out) >= max_bars:
+            out = out[-max_bars:]
+            break
+        time.sleep(exchange.rateLimit / 1000)
+
+    df = pd.DataFrame(out, columns=["ts","o","h","l","c","v"]).drop_duplicates("ts")
     df["ts"] = pd.to_datetime(df["ts"], unit="ms")
-    df = df.drop_duplicates("ts").set_index("ts").sort_index()
+    df.set_index("ts", inplace=True)
     return df
 
 def build_features(df: pd.DataFrame) -> pd.DataFrame:
     d = df.copy()
-    d["ret1"]  = d["c"].pct_change()
-    d["ret3"]  = d["c"].pct_change(3)
-    d["ret5"]  = d["c"].pct_change(5)
-    d["ret20"] = d["c"].pct_change(20)
+    d['vol20'] = d['c'].pct_change().rolling(20).std()
+    
+    d['ret1']  = d['c'].pct_change() / d['vol20']
+    d['ret3']  = d['c'].pct_change(3) / d['vol20']
+    d['ret5']  = d['c'].pct_change(5) / d['vol20']
+    d['ret20'] = d['c'].pct_change(20) / d['vol20']
 
-    d["rsi"] = RSIIndicator(d["c"], window=14).rsi()
+    d['rsi'] = RSIIndicator(d['c'], window=14).rsi()
 
-    d["sma20"] = SMAIndicator(d["c"], 20).sma_indicator()
+    d['sma20'] = SMAIndicator(d['c'], 20).sma_indicator()
     d["sma50"] = SMAIndicator(d["c"], 50).sma_indicator()
     d["sma_ratio"] = d["sma20"] / d["sma50"] - 1
 
@@ -50,7 +74,6 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     rng = (bb.bollinger_hband() - bb.bollinger_lband()).replace(0, np.nan)
     d["bb_pos"] = (d["c"] - bb.bollinger_mavg()) / rng
 
-    d["vol20"] = d["ret1"].rolling(20).std()
     return d.dropna()
 
 def positions_hysteresis_numeric(proba: pd.Series,
@@ -86,16 +109,50 @@ def positions_hysteresis_numeric(proba: pd.Series,
         out.append(state)
     return pd.Series(out, index=proba.index, dtype=int)
 
-def decide_signal(proba_s: pd.Series, thresholds: dict, min_hold: int, cooldown: int):
-    """Возвращает решение по последнему закрытому бару."""
+def decide_signal(proba_s: pd.Series, params: dict):
+    """
+    Возвращает решение по последнему закрытому бару, ИСПОЛЬЗУЯ РОЛЛИНГ ПОРОГИ.
+    `params` — это весь JSON-файл best_thresholds.json.
+    """
+    quantiles = params["quantiles"]
+    rolling_window = params.get("rolling_window", 1000)
+    min_hold = params.get("min_hold", 24)
+    cooldown = params.get("cooldown", 12)
+    
+    if len(proba_s) < rolling_window:
+        return None # Недостаточно данных для роллинг-окна
+
+    # --- Расчет роллинг-порогов ---
+    # Важно: .iloc[:-1] — пороги считаем по истории ДО текущего бара, чтобы избежать lookahead
+    hist_proba = proba_s.iloc[:-1]
+    
+    enter_long_q  = quantiles['enter_long_q']
+    exit_long_q   = quantiles['exit_long_q']
+    enter_short_q = quantiles['enter_short_q']
+    exit_short_q  = quantiles['exit_short_q']
+
+    # Берем последние rolling_window баров из доступной истории
+    relevant_hist = hist_proba.tail(rolling_window)
+    
+    th = {
+        "enter_long":  float(relevant_hist.quantile(enter_long_q)),
+        "exit_long":   float(relevant_hist.quantile(exit_long_q)),
+        "enter_short": float(relevant_hist.quantile(enter_short_q)),
+        "exit_short":  float(relevant_hist.quantile(exit_short_q)),
+    }
+
+    # --- Принятие решения ---
+    # Нам нужны минимум 2 бара (предпоследний и последний), чтобы понять изменение состояния
     pos_raw = positions_hysteresis_numeric(
-        proba_s,
-        thresholds["enter_long"], thresholds["exit_long"],
-        thresholds["enter_short"], thresholds["exit_short"],
+        proba_s.tail(2),
+        th["enter_long"], th["exit_long"],
+        th["enter_short"], th["exit_short"],
         min_hold=min_hold, cooldown=cooldown
     )
+    
     if len(pos_raw) < 2:
         return None
+        
     prev_state = int(pos_raw.iloc[-2])
     next_state = int(pos_raw.iloc[-1])
 
@@ -113,7 +170,8 @@ def decide_signal(proba_s: pd.Series, thresholds: dict, min_hold: int, cooldown:
         next_state=next_state,
         action=action,
         proba=float(proba_s.iloc[-1]),
-        bar_open_ts=proba_s.index[-1]   # время ОТКРЫТИЯ бара-решения
+        bar_open_ts=proba_s.index[-1],
+        thresholds=th # Возвращаем рассчитанные пороги для логгирования
     )
 
 # ----------------- pretty print -----------------
@@ -164,9 +222,10 @@ def main():
 
     # пороги/параметры
     th_all = json.load(open(args.thresholds, "r"))
-    th = th_all["thresholds"]
-    min_hold = int(th_all.get("min_hold", th_all.get("params", {}).get("min_hold", 24)))
-    cooldown = int(th_all.get("cooldown", th_all.get("params", {}).get("cooldown", 12)))
+    quantiles = th_all["quantiles"]
+    rolling_window = th_all.get("rolling_window", 1000)
+    min_hold = int(th_all.get("min_hold", 24))
+    cooldown = int(th_all.get("cooldown", 12))
     smooth_span = int(th_all.get("smooth_span", 12))
     symbol = args.symbol or th_all.get("symbol", "XRP/USDT")
     timeframe = args.timeframe or th_all.get("timeframe", "15m")
@@ -186,9 +245,10 @@ def main():
         nonlocal last_seen_bar_open, pending_exec
 
         # данные
-        df = fetch_recent_ohlcv(ex, symbol, timeframe, limit=max(600, args.history_bars))
-        if len(df) < 200:
-            print(f"Not enough bars ({len(df)})"); return
+        bars_needed = max(rolling_window + 200, args.history_bars)
+        df = fetch_ohlcv_all(ex, symbol, timeframe, max_bars=bars_needed)
+        if len(df) < rolling_window:
+            print(f"Not enough bars ({len(df)}) for rolling window ({rolling_window})"); return
 
         # подтвердить исполнение, если наступил следующий бар
         if pending_exec is not None:
@@ -211,7 +271,7 @@ def main():
             return
 
         # решение
-        sig = decide_signal(proba_s, th, min_hold=min_hold, cooldown=cooldown)
+        sig = decide_signal(proba_s, th_all)
         if not sig: return
 
         tf_delta = timeframe_to_timedelta(timeframe)
@@ -235,7 +295,7 @@ def main():
             "prev_state": sig["prev_state"],
             "next_state": sig["next_state"],
             "planned_exec_ts": str(planned_exec_ts),
-            "thresholds": th,
+            "thresholds": sig["thresholds"],
             "smooth_span": smooth_span
         }
         append_jsonl(args.log, all_rec)
