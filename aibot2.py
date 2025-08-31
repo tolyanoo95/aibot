@@ -21,6 +21,7 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.linear_model import LogisticRegression
 from sklearn.isotonic import IsotonicRegression
 from joblib import dump
+from tqdm import tqdm
 
 warnings.filterwarnings("ignore", category=UserWarning)
 pd.set_option("display.width", 180)
@@ -263,6 +264,53 @@ def positions_hysteresis(proba: pd.Series,
         pos.append(state)
     return pd.Series(pos, index=proba.index, dtype=int)
 
+def positions_hysteresis_rolling(proba: pd.Series,
+                                 enter_long: pd.Series, exit_long: pd.Series,
+                                 enter_short: pd.Series, exit_short: pd.Series,
+                                 min_hold: int = 24, cooldown: int = 12) -> pd.Series:
+    """Состояния -1/0/1 с гистерезисом, min_hold и cooldown, НА РОЛЛИНГ ПОРОГАХ."""
+    state, hold, cd = 0, 0, 0
+    pos = []
+    
+    df_merged = pd.concat([proba, enter_long, exit_long, enter_short, exit_short], axis=1)
+    df_merged.columns = ['p', 'el', 'xl', 'es', 'xs']
+    df_merged = df_merged.dropna()
+
+    _p = df_merged['p'].values
+    _el = df_merged['el'].values
+    _xl = df_merged['xl'].values
+    _es = df_merged['es'].values
+    _xs = df_merged['xs'].values
+
+    for i in range(len(df_merged)):
+        p, el, xl, es, xs = _p[i], _el[i], _xl[i], _es[i], _xs[i]
+
+        if cd > 0:
+            if state != 0:
+                hold += 1
+                if state == 1 and hold >= min_hold and p < xl:
+                    state, hold, cd = 0, 0, cooldown
+                elif state == -1 and hold >= min_hold and p > xs:
+                    state, hold, cd = 0, 0, cooldown
+            else:
+                cd -= 1
+        else:
+            if state == 0:
+                if p > el:
+                    state, hold = 1, 0
+                elif p < es:
+                    state, hold = -1, 0
+            elif state == 1:
+                hold += 1
+                if hold >= min_hold and p < xl:
+                    state, hold, cd = 0, 0, cooldown
+            elif state == -1:
+                hold += 1
+                if hold >= min_hold and p > xs:
+                    state, hold, cd = 0, 0, cooldown
+        pos.append(state)
+    return pd.Series(pos, index=df_merged.index, dtype=int)
+
 # ----------------------------- Backtests -----------------------------
 def _align_by_open_next(df: pd.DataFrame, proba: pd.Series):
     """
@@ -279,33 +327,29 @@ def _align_by_open_next(df: pd.DataFrame, proba: pd.Series):
     proba = proba.loc[ret.index]             # решение на close[t], исполнение на open[t+1]
     return df, ret, proba
 
-def backtest_hysteresis_open_next(df: pd.DataFrame, proba: pd.Series, tf: str,
-                                  enter_long_q=0.90, exit_long_q=0.70,
-                                  enter_short_q=0.10, exit_short_q=0.30,
-                                  min_hold=24, cooldown=12,
-                                  fee_per_side=FEE_PER_SIDE, slippage_per_side=SLIPPAGE_PER_SIDE) -> dict:
+def backtest_hysteresis_rolling_thresholds(df: pd.DataFrame, proba: pd.Series, tf: str,
+                                         enter_long_q=0.90, exit_long_q=0.70,
+                                         enter_short_q=0.10, exit_short_q=0.30,
+                                         min_hold=24, cooldown=12, rolling_window=1000,
+                                         fee_per_side=FEE_PER_SIDE, slippage_per_side=SLIPPAGE_PER_SIDE) -> dict:
     df, ret, proba = _align_by_open_next(df, proba)
-    if len(ret) < 10:
+    if len(ret) < rolling_window:
         return dict(sharpe=0.0, cagr=0.0, max_dd=0.0, n_bars=0, turns=0,
                     long_share=0.0, short_share=0.0, neutral_share=1.0,
-                    thresholds=dict(enter_long=np.nan, exit_long=np.nan,
-                                    enter_short=np.nan, exit_short=np.nan),
-                    params=dict(enter_long_q=enter_long_q, exit_long_q=exit_long_q,
-                                enter_short_q=enter_short_q, exit_short_q=exit_short_q,
-                                min_hold=min_hold, cooldown=cooldown),
+                    thresholds=None, params={},
                     equity=pd.Series(dtype=float), ret=pd.Series(dtype=float), pos=pd.Series(dtype=int))
 
-    q = proba.quantile
-    enter_long  = float(q(enter_long_q))
-    exit_long   = float(q(exit_long_q))
-    enter_short = float(q(enter_short_q))
-    exit_short  = float(q(exit_short_q))
+    min_p = max(1, int(rolling_window * 0.8))
+    enter_long_s  = proba.rolling(rolling_window, min_periods=min_p).quantile(enter_long_q)
+    exit_long_s   = proba.rolling(rolling_window, min_periods=min_p).quantile(exit_long_q)
+    enter_short_s = proba.rolling(rolling_window, min_periods=min_p).quantile(enter_short_q)
+    exit_short_s  = proba.rolling(rolling_window, min_periods=min_p).quantile(exit_short_q)
 
-    pos_raw = positions_hysteresis(proba, enter_long, exit_long, enter_short, exit_short,
-                                   min_hold=min_hold, cooldown=cooldown)
-    # исполнение на open[t+1] => позиция действует на ретёрн ret[t]
+    pos_raw = positions_hysteresis_rolling(proba, enter_long_s, exit_long_s, enter_short_s, exit_short_s,
+                                           min_hold=min_hold, cooldown=cooldown)
+    
     pos_exec = pos_raw.shift(1).reindex(ret.index).fillna(0).astype(int)
-
+    
     turns = pos_exec.diff().abs().fillna(0)
     cost_per_side = float(fee_per_side + slippage_per_side)
     costs = turns * cost_per_side
@@ -329,11 +373,10 @@ def backtest_hysteresis_open_next(df: pd.DataFrame, proba: pd.Series, tf: str,
         long_share=float((pos_raw == 1).mean()) if len(pos_raw) else 0.0,
         short_share=float((pos_raw == -1).mean()) if len(pos_raw) else 0.0,
         neutral_share=float((pos_raw == 0).mean()) if len(pos_raw) else 1.0,
-        thresholds=dict(enter_long=enter_long, exit_long=exit_long,
-                        enter_short=enter_short, exit_short=exit_short),
+        thresholds=None,
         params=dict(enter_long_q=enter_long_q, exit_long_q=exit_long_q,
                     enter_short_q=enter_short_q, exit_short_q=exit_short_q,
-                    min_hold=min_hold, cooldown=cooldown),
+                    min_hold=min_hold, cooldown=cooldown, rolling_window=rolling_window),
         equity=eq, ret=strat_ret, pos=pos_raw
     )
 
@@ -382,50 +425,56 @@ def backtest_hysteresis_fixed_thresholds_open(df: pd.DataFrame, proba: pd.Series
     )
 
 # ----------------------------- Threshold search -----------------------------
-def search_thresholds(proba: pd.Series, df_feat: pd.DataFrame, tf: str,
-                      turnover_cap=DEFAULT_TURNOVER_CAP, max_dd_cap=DEFAULT_MAX_DD_CAP,
-                      fee_per_side=FEE_PER_SIDE, slippage_per_side=SLIPPAGE_PER_SIDE):
+def search_rolling_parameters(proba: pd.Series, df_feat: pd.DataFrame, tf: str,
+                              turnover_cap=DEFAULT_TURNOVER_CAP, max_dd_cap=DEFAULT_MAX_DD_CAP,
+                              fee_per_side=FEE_PER_SIDE, slippage_per_side=SLIPPAGE_PER_SIDE):
     """
-    Перебор порогов + min_hold/cooldown.
+    Перебор параметров для РОЛЛИНГ порогов.
     Возвращает лучший по Sharpe в cap и лучший без cap (loose).
     """
-    grid_enter = [0.80, 0.85, 0.90, 0.93]
+    grid_enter = [0.85, 0.90, 0.95]
     grid_exit  = [0.60, 0.65, 0.70]
-    grid_enter_s = [0.20, 0.15, 0.10, 0.07]
+    grid_enter_s = [0.15, 0.10, 0.05]
     grid_exit_s  = [0.40, 0.35, 0.30]
-    grid_hold = [16, 24, 36, 48]
-    cooldowns = [4, 12, 24]
+    grid_hold = [24, 36]
+    cooldowns = [12, 24]
+    grid_window = [500, 1000, 2000]
 
     best, best_stats = None, None
     best_loose, best_loose_stats = None, None
 
-    for el in grid_enter:
-        for xl in grid_exit:
-            if xl >= el:
-                continue
-            for es in grid_enter_s:
-                for xs in grid_exit_s:
-                    if xs <= es:
-                        continue
-                    for mh in grid_hold:
-                        for cd in cooldowns:
-                            stats = backtest_hysteresis_open_next(
-                                df_feat, proba, tf,
-                                enter_long_q=el, exit_long_q=xl,
-                                enter_short_q=es, exit_short_q=xs,
-                                min_hold=mh, cooldown=cd,
-                                fee_per_side=fee_per_side, slippage_per_side=slippage_per_side
-                            )
-                            if stats['n_bars'] == 0:
-                                continue
-                            tp_bar = stats['turns'] / max(1, stats['n_bars'])
-                            # лучший без ограничений
-                            if (best_loose is None) or (stats['sharpe'] > best_loose_stats['sharpe']):
-                                best_loose, best_loose_stats = (el, xl, es, xs, mh, cd), stats
-                            # ограничения по обороту и MaxDD
-                            if tp_bar <= turnover_cap and stats['max_dd'] >= -max_dd_cap:
-                                if (best is None) or (stats['sharpe'] > best_stats['sharpe']):
-                                    best, best_stats = (el, xl, es, xs, mh, cd), stats
+    total_iters = len(grid_enter) * len(grid_exit) * len(grid_enter_s) * len(grid_exit_s) * \
+                  len(grid_hold) * len(cooldowns) * len(grid_window)
+    
+    pbar = tqdm(total=total_iters, desc="Searching rolling params", ncols=100)
+
+    for rw in grid_window:
+        for el in grid_enter:
+            for xl in grid_exit:
+                if xl >= el: continue
+                for es in grid_enter_s:
+                    for xs in grid_exit_s:
+                        if xs <= es: continue
+                        for mh in grid_hold:
+                            for cd in cooldowns:
+                                pbar.update(1)
+                                stats = backtest_hysteresis_rolling_thresholds(
+                                    df_feat, proba, tf,
+                                    enter_long_q=el, exit_long_q=xl,
+                                    enter_short_q=es, exit_short_q=xs,
+                                    min_hold=mh, cooldown=cd, rolling_window=rw,
+                                    fee_per_side=fee_per_side, slippage_per_side=slippage_per_side
+                                )
+                                if stats['n_bars'] == 0: continue
+                                
+                                tp_bar = stats['turns'] / max(1, stats['n_bars'])
+                                if (best_loose is None) or (stats['sharpe'] > best_loose_stats['sharpe']):
+                                    best_loose, best_loose_stats = (el, xl, es, xs, mh, cd, rw), stats
+                                
+                                if tp_bar <= turnover_cap and stats['max_dd'] >= -max_dd_cap:
+                                    if (best is None) or (stats['sharpe'] > best_stats['sharpe']):
+                                        best, best_stats = (el, xl, es, xs, mh, cd, rw), stats
+    pbar.close()
     return best, best_stats, best_loose, best_loose_stats
 
 # ----------------------------- Trades (open-exec) & JSON -----------------------------
@@ -627,6 +676,7 @@ def main():
     parser.add_argument("--cv-purge", type=int, default=None, help="purge bars (по умолчанию = horizon)")
     parser.add_argument("--cv-embargo", type=int, default=None, help="embargo bars (по умолчанию = horizon//2)")
     parser.add_argument("--calibrate", type=str, default="none", choices=["none","isotonic","platt"], help="калибровка вероятностей по последнему окну")
+    parser.add_argument("--train-bars", type=int, default=35000, help="Use only last N bars for final model training (0=all)")
     parser.add_argument("--plot", action="store_true")
     args = parser.parse_args()
 
@@ -685,7 +735,7 @@ def main():
         pass
 
     # ===== Подбор порогов (на всей истории)
-    best, best_stats, best_loose, best_loose_stats = search_thresholds(
+    best, best_stats, best_loose, best_loose_stats = search_rolling_parameters(
         proba_s, df_feat, args.timeframe,
         turnover_cap=args.turnover_cap, max_dd_cap=args.max_dd_cap,
         fee_per_side=FEE_PER_SIDE, slippage_per_side=SLIPPAGE_PER_SIDE
@@ -696,10 +746,10 @@ def main():
         print("Попробуй: --horizon 48 --smooth-span 24 --turnover-cap 0.02 --max-dd-cap 0.50")
         return
 
-    def save_common_outputs(stats, el, xl, es, xs, mh, cd, loose_flag=False):
+    def save_common_outputs(stats, el, xl, es, xs, mh, cd, rw, loose_flag=False):
         tag = "LOOSE, cap violated" if loose_flag else "OOF, turnover≤cap & DD≤cap"
         print(f"\n=== Best thresholds ({tag}) ===")
-        print(f"enter_long_q={el}, exit_long_q={xl}, enter_short_q={es}, exit_short_q={xs}, min_hold={mh}, cooldown={cd}")
+        print(f"enter_long_q={el}, exit_long_q={xl}, enter_short_q={es}, exit_short_q={xs}, min_hold={mh}, cooldown={cd}, window={rw}")
         print("Thresholds:", stats['thresholds'])
         tp_bar = stats['turns']/max(1,stats['n_bars'])
         print("\n=== Backtest (OOF · hysteresis · open-next) ===")
@@ -731,6 +781,7 @@ def main():
             "max_dd_cap": args.max_dd_cap,
             "calibration": args.calibrate,
             "quantiles": {"enter_long_q": el, "exit_long_q": xl, "enter_short_q": es, "exit_short_q": xs},
+            "rolling_window": rw,
             "thresholds": stats["thresholds"],
             "min_hold": mh,
             "cooldown": cd,
@@ -783,11 +834,11 @@ def main():
 
     # Печать/сохранение для лучшего варианта
     if best is not None:
-        (el, xl, es, xs, mh, cd) = best
-        save_common_outputs(best_stats, el, xl, es, xs, mh, cd, loose_flag=False)
+        (el, xl, es, xs, mh, cd, rw) = best
+        save_common_outputs(best_stats, el, xl, es, xs, mh, cd, rw, loose_flag=False)
     else:
-        (el, xl, es, xs, mh, cd) = best_loose
-        save_common_outputs(best_loose_stats, el, xl, es, xs, mh, cd, loose_flag=True)
+        (el, xl, es, xs, mh, cd, rw) = best_loose
+        save_common_outputs(best_loose_stats, el, xl, es, xs, mh, cd, rw, loose_flag=True)
 
     # ===== Оценка за последние N дней: калибруем до окна, фикс-пороги в окне
     if args.last_days and args.last_days > 0:
@@ -796,7 +847,7 @@ def main():
         # 1) Калибровка порогов только по истории ДО окна
         proba_hist = proba_s.loc[proba_s.index <= cutoff]
         feat_hist  = df_feat.loc[df_feat.index <= cutoff]
-        best_hist, stats_hist, best_loose_hist, stats_loose_hist = search_thresholds(
+        best_hist, stats_hist, best_loose_hist, stats_loose_hist = search_rolling_parameters(
             proba_hist, feat_hist, args.timeframe,
             turnover_cap=args.turnover_cap, max_dd_cap=args.max_dd_cap,
             fee_per_side=FEE_PER_SIDE, slippage_per_side=SLIPPAGE_PER_SIDE
@@ -804,19 +855,19 @@ def main():
         if best_hist is None and best_loose_hist is None:
             print(f"\n[Last {args.last_days}d] Не удалось откалибровать пороги на истории до окна.")
         else:
-            if best_hist is not None:
-                el, xl, es, xs, mh, cd = best_hist
-                th = stats_hist["thresholds"]
+            use_loose_days = best_hist is None
+            if use_loose_days:
+                _, _, _, _, mh_d, cd_d, rw_d = best_loose_hist
             else:
-                el, xl, es, xs, mh, cd = best_loose_hist
-                th = stats_loose_hist["thresholds"]
+                _, _, _, _, mh_d, cd_d, rw_d = best_hist
 
-            # 2) Тест только в окне (фиксированные thresholds!)
+            # 2) Тест только в окне (с роллинг-параметрами)
             proba_last = proba_s.loc[proba_s.index > cutoff]
             feat_last  = df_feat.loc[df_feat.index > cutoff]
-            stats_last = backtest_hysteresis_fixed_thresholds_open(
+            stats_last = backtest_hysteresis_rolling_thresholds(
                 feat_last, proba_last, args.timeframe,
-                thresholds=th, min_hold=mh, cooldown=cd,
+                enter_long_q=el, exit_long_q=xl, enter_short_q=es, exit_short_q=xs,
+                min_hold=mh_d, cooldown=cd_d, rolling_window=rw_d,
                 fee_per_side=FEE_PER_SIDE, slippage_per_side=SLIPPAGE_PER_SIDE
             )
 
@@ -865,36 +916,56 @@ def main():
                   f"final_value={final_value:.2f}, deposits={dep:.2f}, withdrawals={wd:.2f}")
 
     # ===== OOT: калибруем на 80%, тестим на 20% (фиксируем пороги из калибровки)
-    cut = int(len(proba_s) * 0.8)
-    proba_calib, proba_test = proba_s.iloc[:cut], proba_s.iloc[cut:]
-    feat_calib, feat_test   = df_feat.iloc[:cut], df_feat.iloc[cut:]
+    print("\n=== OOT Validation (train on first 80%, test on last 20%) ===")
+    cut_idx = int(len(proba_s) * 0.8)
+    cut_ts = proba_s.index[cut_idx]
 
-    best_cal, stats_cal, *_ = search_thresholds(
+    proba_calib, proba_test = proba_s.iloc[:cut_idx], proba_s.iloc[cut_idx:]
+    feat_calib, feat_test   = df_feat.loc[proba_calib.index], df_feat.loc[proba_test.index]
+    print(f"Split: {len(proba_calib)} bars for calibration (until {cut_ts}), {len(proba_test)} for test.")
+
+    best_cal, stats_cal, best_loose_cal, stats_loose_cal = search_rolling_parameters(
         proba_calib, feat_calib, args.timeframe,
         turnover_cap=args.turnover_cap, max_dd_cap=args.max_dd_cap,
         fee_per_side=FEE_PER_SIDE, slippage_per_side=SLIPPAGE_PER_SIDE
     )
-    if best_cal is not None:
-        el, xl, es, xs, mh, cd = best_cal
-        stats_oot = backtest_hysteresis_open_next(
-            feat_test, proba_test, args.timeframe,
-            enter_long_q=el, exit_long_q=xl, enter_short_q=es, exit_short_q=xs,
-            min_hold=mh, cooldown=cd,
-            fee_per_side=FEE_PER_SIDE, slippage_per_side=SLIPPAGE_PER_SIDE
-        )
-        print("\n=== OOT (20%) with fixed thresholds from first 80% (open-next) ===")
-        print(f"Sharpe: {stats_oot['sharpe']:.2f}, CAGR: {stats_oot['cagr']:.2%}, MaxDD: {stats_oot['max_dd']:.2%}, Turns/bar: {stats_oot['turns']/max(1,stats_oot['n_bars']):.3f}")
-        if args.plot and len(stats_oot['equity']):
-            plt.figure(figsize=(10,5))
-            stats_oot['equity'].plot(label='Strategy (OOT)')
-            eq_bh = (df_feat['c'].loc[stats_oot['equity'].index] / df_feat['c'].loc[stats_oot['equity'].index][0])
-            eq_bh.plot(label='Buy & Hold')
-            plt.legend(); plt.title("Equity OOT (fixed thresholds, open-next)")
-            plt.grid(True, alpha=0.3); plt.tight_layout(); plt.show()
-    else:
-        print("\nOOT: не удалось найти пороги на калибровочном участке в заданных лимитах.")
 
-    # === Save final model for live inference ===
+    if best_cal is None and best_loose_cal is None:
+        print("\nНе удалось подобрать параметры на калибровочном участке (80%).")
+        print("Попробуйте ослабить ограничения: --turnover-cap 0.05 --max-dd-cap 0.50")
+        return
+
+    use_loose = best_cal is None
+    if use_loose:
+        print("\nWARNING: Используются параметры без ограничений (turnover/DD), т.к. в лимитах не найдено.")
+        (el, xl, es, xs, mh, cd, rw) = best_loose_cal
+        thresholds = stats_loose_cal["thresholds"]
+    else:
+        (el, xl, es, xs, mh, cd, rw) = best_cal
+        thresholds = stats_cal["thresholds"]
+
+    # --- Тест на OOT-участке с найденными роллинг-параметрами
+    stats_oot = backtest_hysteresis_rolling_thresholds(
+        feat_test, proba_test, args.timeframe,
+        enter_long_q=el, exit_long_q=xl, enter_short_q=es, exit_short_q=xs,
+        min_hold=mh, cooldown=cd, rolling_window=rw,
+        fee_per_side=FEE_PER_SIDE, slippage_per_side=SLIPPAGE_PER_SIDE
+    )
+
+    print("\n--- OOT backtest results (last 20%) ---")
+    tp_bar_oot = stats_oot['turns']/max(1, stats_oot['n_bars'])
+
+    print(f"Sharpe: {stats_oot['sharpe']:.2f}, CAGR: {stats_oot['cagr']:.2%}, MaxDD: {stats_oot['max_dd']:.2%}, Turns/bar: {tp_bar_oot:.3f}")
+    if args.plot and len(stats_oot['equity']):
+        plt.figure(figsize=(10,5))
+        stats_oot['equity'].plot(label='Strategy (OOT)')
+        eq_bh = (df_feat['c'].loc[stats_oot['equity'].index] / df_feat['c'].loc[stats_oot['equity'].index][0])
+        eq_bh.plot(label='Buy & Hold')
+        plt.legend(); plt.title("Equity OOT (fixed thresholds, open-next)")
+        plt.grid(True, alpha=0.3); plt.tight_layout(); plt.show()
+
+    # === Save final model for live inference (trained on all data) ===
+    print("\nTraining final model on all available data...")
     final_params = dict(
         n_estimators=2000, learning_rate=0.01, num_leaves=31, max_depth=-1,
         min_child_samples=20,
@@ -903,7 +974,16 @@ def main():
         verbosity=-1, random_state=RANDOM_STATE
     )
     final_model = LGBMClassifier(**final_params)
-    final_model.fit(X, y)  # тренируем на всей истории
+    
+    X_train, y_train = X, y
+    if args.train_bars > 0 and len(X) > args.train_bars:
+        X_train = X.tail(args.train_bars)
+        y_train = y.loc[X_train.index]
+        print(f"Using last {len(X_train)} bars for training.")
+    else:
+        print("Using all available data for training.")
+
+    final_model.fit(X_train, y_train)  # тренируем на всей или части истории
     dump({"model": final_model,
           "feat_cols": list(X.columns),
           "smooth_span": args.smooth_span}, "final_model_lgbm.pkl")
