@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-import os, sys, json, time, argparse, warnings
+import os, sys, json, time, argparse
 import numpy as np
 import pandas as pd
 import ccxt
@@ -9,8 +9,6 @@ from joblib import load
 from ta.momentum import RSIIndicator
 from ta.trend import SMAIndicator, MACD
 from ta.volatility import BollingerBands
-
-warnings.filterwarnings("ignore", category=UserWarning)
 
 # ----------------- defaults -----------------
 DEFAULT_SYMBOL = "SOL/USDT"
@@ -115,65 +113,67 @@ def positions_hysteresis_numeric(proba: pd.Series,
         out.append(state)
     return pd.Series(out, index=proba.index, dtype=int)
 
-# --------- trades (open→open исполнение) ---------
-def extract_trades_from_pos_open(df_oc: pd.DataFrame, pos_exec: pd.Series,
-                                 fee_per_side=FEE_PER_SIDE_DEFAULT, slippage_per_side=SLIP_PER_SIDE_DEFAULT) -> pd.DataFrame:
-    """
-    Превращает позиции (-1/0/1), сдвинутые на 1 бар (исполнение), в сделки.
-    Вход/выход по PRICE=OPEN бара исполнения (совпадает с лайв-логикой).
-    """
-    df = df_oc.copy()[["o","c"]]
-    idx = df.index.intersection(pos_exec.index)
-    if len(idx) == 0:
-        cols = ['side','entry_ts','exit_ts','entry_price','exit_price','gross_ret','net_ret','net_pct','bars','win']
-        return pd.DataFrame(columns=cols)
+def extract_trades_from_pos(prices: pd.Series, pos_exec: pd.Series,
+                            fee_per_side=FEE_PER_SIDE_DEFAULT, slippage_per_side=SLIP_PER_SIDE_DEFAULT) -> pd.DataFrame:
+    prices = prices.sort_index()
+    pos_exec = pos_exec.sort_index().astype(int)
+    idx = prices.index.intersection(pos_exec.index)
+    px = prices.loc[idx]
+    ps = pos_exec.loc[idx]
 
-    o = df.loc[idx, 'o'].astype(float)
-    ps = pos_exec.loc[idx].astype(int)
     cost_side = float(fee_per_side + slippage_per_side)
+    trades = []
+    cur = None  # {'side': 1/-1, 'entry_ts', 'entry_price', 'entry_i'}
 
-    trades, cur = [], None
     for i, ts in enumerate(idx):
         p = int(ps.iloc[i])
-        price_open = float(o.iloc[i])
+        price = float(px.iloc[i])
 
         if cur is None:
             if p != 0:
-                cur = dict(side=p, entry_ts=ts, entry_price=price_open, entry_i=i)
+                cur = dict(side=p, entry_ts=ts, entry_price=price, entry_i=i)
             continue
 
         if p == cur["side"]:
             continue
 
-        # закрытие по текущему open
-        side = cur["side"]; entry_price = float(cur["entry_price"])
-        exit_ts = ts; exit_price = price_open
+        # закрываем текущую позицию
+        side = cur["side"]
+        entry_price = float(cur["entry_price"])
+        exit_ts = ts
+        exit_price = price
+
         gross = (exit_price / entry_price - 1.0) if side == 1 else (entry_price / exit_price - 1.0)
         net = (1.0 + gross) * (1.0 - cost_side) * (1.0 - cost_side) - 1.0
         bars_held = i - int(cur["entry_i"])
+
         trades.append(dict(
             side="long" if side == 1 else "short",
             entry_ts=cur["entry_ts"], exit_ts=exit_ts,
             entry_price=entry_price, exit_price=exit_price,
-            gross_ret=gross, net_ret=net, net_pct=net*100, bars=bars_held
+            gross_ret=gross, net_ret=net, net_pct=net*100,
+            bars=bars_held
         ))
 
         cur = None
         if p != 0:  # flip
-            cur = dict(side=p, entry_ts=ts, entry_price=price_open, entry_i=i)
+            cur = dict(side=p, entry_ts=ts, entry_price=price, entry_i=i)
 
-    # закрыть хвост «для отчёта» по последнему open
+    # закрываем на последней цене, если что-то осталось
     if cur is not None and len(idx):
-        ts = idx[-1]; price_open = float(o.iloc[-1])
-        side = cur["side"]; entry_price = float(cur["entry_price"])
-        gross = (price_open / entry_price - 1.0) if side == 1 else (entry_price / price_open - 1.0)
+        ts = idx[-1]
+        price = float(px.iloc[-1])
+        side = cur["side"]
+        entry_price = float(cur["entry_price"])
+        gross = (price / entry_price - 1.0) if side == 1 else (entry_price / price - 1.0)
         net = (1.0 + gross) * (1.0 - cost_side) * (1.0 - cost_side) - 1.0
         bars_held = len(idx) - 1 - int(cur["entry_i"])
         trades.append(dict(
             side="long" if side == 1 else "short",
             entry_ts=cur["entry_ts"], exit_ts=ts,
-            entry_price=entry_price, exit_price=price_open,
-            gross_ret=gross, net_ret=net, net_pct=net*100, bars=bars_held
+            entry_price=entry_price, exit_price=price,
+            gross_ret=gross, net_ret=net, net_pct=net*100,
+            bars=bars_held
         ))
 
     df_tr = pd.DataFrame(trades)
@@ -207,6 +207,7 @@ def summarize_trades(trades: pd.DataFrame) -> str:
 
 # -------- cashflows (депозиты/выводы) --------
 def load_cashflows(path: str) -> pd.Series:
+    """cashflows.json -> Series(amount) по времени."""
     if not path or not os.path.exists(path):
         return pd.Series(dtype=float)
     with open(path, "r", encoding="utf-8") as f:
@@ -224,6 +225,7 @@ def load_cashflows(path: str) -> pd.Series:
     return s
 
 def align_cashflows_to_index(cflows: pd.Series, bar_index: pd.Index) -> pd.Series:
+    """К каждому кэшфлоу подбираем ближайший следующий бар (если позже последнего — игнорируем)."""
     if cflows is None or cflows.empty or len(bar_index) == 0:
         return pd.Series(dtype=float)
     mapped = {}
@@ -263,23 +265,23 @@ def equity_with_cashflows(strat_ret: pd.Series, initial_capital: float, cflows_o
 
 # ----------------- main -----------------
 def main():
-    ap = argparse.ArgumentParser(description="Replay trades (close->decide, open_next->execute) + cashflows")
-    ap.add_argument("--model", default="final_model_lgbm.pkl", help="файл модели (из тренера)")
-    ap.add_argument("--thresholds", default="best_thresholds.json", help="файл порогов (из тренера)")
+    ap = argparse.ArgumentParser(description="Replay trades from saved model & thresholds (+cashflows)")
+    ap.add_argument("--model", default="final_model_lgbm.pkl", help="файл модели (из aibot.py)")
+    ap.add_argument("--thresholds", default="best_thresholds.json", help="файл порогов (из aibot.py)")
     ap.add_argument("--symbol", default=None, help="переписать символ (иначе из thresholds)")
     ap.add_argument("--timeframe", default=None, help="переписать TF (иначе из thresholds)")
     ap.add_argument("--max-bars", type=int, default=DEFAULT_MAX_BARS)
     ap.add_argument("--smooth-span", type=int, default=None, help="переписать сглаживание (иначе из модели/порогов)")
     ap.add_argument("--initial-capital", type=float, default=10_000.0, help="стартовый депозит")
-    ap.add_argument("--cashflows", type=str, default="cashflows.json", help="JSON с кэшфлоу [{'ts': 'YYYY-MM-DD HH:MM:SS', 'amount': 1000}, ...]")
-    ap.add_argument("--out-prefix", default="trades_replay", help="префикс для trades/equity файлов")
+    ap.add_argument("--cashflows", type=str, default="cashflows.json", help="JSON с депозитами/выводами [{'ts': 'YYYY-MM-DD HH:MM:SS', 'amount': 1000}, ...]")
+    ap.add_argument("--out-prefix", default="trades_replay", help="префикс для файлов вывода")
     args = ap.parse_args()
 
     if not os.path.exists(args.model):
-        print(f"Не найден файл модели: {args.model}\nСначала обучи и сохрани модель.")
+        print(f"Не найден файл модели: {args.model}\nСначала запусти aibot.py и сохрани модель.")
         sys.exit(1)
     if not os.path.exists(args.thresholds):
-        print(f"Не найден файл порогов: {args.thresholds}\nСначала подбери пороги.")
+        print(f"Не найден файл порогов: {args.thresholds}\nСначала запусти aibot.py для подбора порогов.")
         sys.exit(1)
 
     # читаем пороги/параметры
@@ -310,41 +312,39 @@ def main():
     # фичи и X (shift(1) против утечек)
     feat = build_features(df)
     X = feat[feat_cols].shift(1).dropna()
-    prices_close = feat["c"].loc[X.index]
-    prices_open  = feat["o"].loc[X.index]
+    prices = feat["c"].loc[X.index]
 
     # предсказания и сглаживание
     proba = pd.Series(model.predict_proba(X)[:, 1], index=X.index)
     proba_s = proba.ewm(span=int(smooth_span), adjust=False).mean() if smooth_span and smooth_span > 1 else proba
 
-    # позиции и сделки (решение на close, исполнение на open следующего)
+    # позиции и сделки
     pos_raw = positions_hysteresis_numeric(
         proba_s, th["enter_long"], th["exit_long"], th["enter_short"], th["exit_short"],
         min_hold=min_hold, cooldown=cooldown
     )
-    # pos_exec — позиции, действующие НА баре исполнения (open[t]) => сдвиг на 1
-    pos_exec = pos_raw.shift(1).reindex(prices_open.index).fillna(0).astype(int)
+    pos_exec = pos_raw.shift(1).reindex(prices.index).fillna(0).astype(int)
+    trades = extract_trades_from_pos(prices, pos_exec, fee_per_side=fee_side, slippage_per_side=slip_side)
 
-    trades = extract_trades_from_pos_open(feat[["o","c"]], pos_exec,
-                                          fee_per_side=fee_side, slippage_per_side=slip_side)
-
-    # === доходность стратегии по open→open (совпадает с лайвом)
-    ret_open = (prices_open.shift(-1) / prices_open - 1.0).dropna()
-    pos_e = pos_exec.reindex(ret_open.index).fillna(0).astype(int)
-
+    # === стратегия: помесячная доходность баров (для equity)
+    ret = prices.pct_change().dropna()
+    # выравниваем
+    idx = ret.index.intersection(pos_exec.index)
+    ret = ret.loc[idx]
+    pos_e = pos_exec.loc[idx]
     turns = pos_e.diff().abs().fillna(0)
     cost_side = float(fee_side + slip_side)
     costs = turns * cost_side
-    strat_ret = (pos_e * ret_open - costs).dropna()
+    strat_ret = pos_e * ret - costs  # доходность стратегии на бар
 
-    # --- Денежное эквити с депозитами/выводами
+    # кэшфлоу и equity
     cflows = load_cashflows(args.cashflows)
     cflows_on_bars = align_cashflows_to_index(cflows, strat_ret.index)
     cash_eq, dep, wd, final_value, profit, roi = equity_with_cashflows(
         strat_ret, args.initial_capital, cflows_on_bars
     )
 
-    # выводы (trades + equity + summary)
+    # выводы (сделки + equity + summary)
     csv_path = f"{args.out_prefix}.csv"
     json_path = f"{args.out_prefix}.json"
     trades.to_csv(csv_path, index=False)
