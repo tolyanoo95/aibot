@@ -22,14 +22,6 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.isotonic import IsotonicRegression
 from joblib import dump
 
-# skopt (optional, для Bayesian thresholds)
-try:
-    from skopt import gp_minimize
-    from skopt.space import Real, Integer
-    _HAS_SKOPT = True
-except Exception:
-    _HAS_SKOPT = False
-
 warnings.filterwarnings("ignore", category=UserWarning)
 pd.set_option("display.width", 180)
 pd.set_option("display.max_columns", 60)
@@ -38,14 +30,14 @@ pd.set_option("display.max_columns", 60)
 DEFAULT_SYMBOL = "SOL/USDT"
 DEFAULT_TIMEFRAME = "15m"
 DEFAULT_MAX_BARS = 60000           # ~2-3 года на 15m
-DEFAULT_HORIZON_BARS = 24           # горизонт цели (≈ 6ч для 15m)
-DEFAULT_SMOOTH_SPAN = 12            # EMA сглаживание вероятностей
-FEE_PER_SIDE = 0.0003               # комиссия на сторону (0.03%)
-SLIPPAGE_PER_SIDE = 0.0001          # проскальзывание на сторону (0.01%)
+DEFAULT_HORIZON_BARS = 24 #48            # горизонт цели (≈ 6ч для 15m)
+DEFAULT_SMOOTH_SPAN = 12 #36            # EMA сглаживание вероятностей
+FEE_PER_SIDE = 0.0003                # комиссия на сторону (0.03%)
+SLIPPAGE_PER_SIDE = 0.0001           # проскальзывание на сторону (0.01%)
 RANDOM_STATE = 42
-DEFAULT_TURNOVER_CAP = 0.05         # макс. поворотов на бар
-DEFAULT_MAX_DD_CAP = 0.30           # макс. просадка для отбора порогов (улучшено)
-DEFAULT_LAST_DAYS = 0               # окно "последние N дней", 0=выключено
+DEFAULT_TURNOVER_CAP = 0.05 #0.02         # макс. поворотов на бар
+DEFAULT_MAX_DD_CAP = 0.40            # макс. просадка для отбора порогов
+DEFAULT_LAST_DAYS = 0                # окно "последние N дней", 0=выключено
 
 # ----------------------------- Utils -----------------------------
 def timeframe_to_minutes(tf: str) -> int:
@@ -66,94 +58,6 @@ def max_drawdown(equity: pd.Series) -> float:
     dd = equity / roll_max - 1.0
     return float(dd.min()) if len(dd) else 0.0
 
-def calculate_kelly_fraction(returns: pd.Series, win_rate: float = None, avg_win: float = None, avg_loss: float = None) -> float:
-    """Вычисляет долю Kelly для оптимального размера позиции"""
-    if len(returns) < 20:
-        return 0.25  # консервативное значение по умолчанию
-    
-    if win_rate is None or avg_win is None or avg_loss is None:
-        wins = returns[returns > 0]
-        losses = returns[returns < 0]
-        if len(wins) == 0 or len(losses) == 0:
-            return 0.25
-        win_rate = len(wins) / len(returns)
-        avg_win = wins.mean()
-        avg_loss = abs(losses.mean())
-    
-    if avg_loss == 0:
-        return 0.25
-    
-    b = avg_win / avg_loss  # odds
-    p = win_rate
-    kelly = (b * p - (1 - p)) / b
-    
-    # Ограничиваем Kelly для безопасности
-    return max(0.1, min(0.5, kelly))
-
-def calculate_volatility_adjustment(returns: pd.Series, lookback: int = 60) -> float:
-    """Корректировка размера позиции на основе волатильности"""
-    if len(returns) < lookback:
-        return 1.0
-    
-    recent_vol = returns.tail(lookback).std()
-    long_vol = returns.std()
-    
-    if long_vol == 0:
-        return 1.0
-    
-    vol_ratio = recent_vol / long_vol
-    # Если текущая волатильность выше - уменьшаем позицию
-    return min(1.5, max(0.5, 1.0 / vol_ratio))
-
-def calculate_dynamic_position_size(proba: float, returns_history: pd.Series, 
-                                  base_size: float = 1.0, max_size: float = 1.0) -> float:
-    """Динамический расчет размера позиции"""
-    # Kelly fraction
-    kelly = calculate_kelly_fraction(returns_history)
-    
-    # Volatility adjustment
-    vol_adj = calculate_volatility_adjustment(returns_history)
-    
-    # Confidence adjustment (на основе вероятности)
-    conf_adj = 1.0
-    if proba > 0.7:
-        conf_adj = 1.2  # увеличиваем при высокой уверенности
-    elif proba < 0.3:
-        conf_adj = 1.2  # для шортов
-    elif 0.45 < proba < 0.55:
-        conf_adj = 0.6  # уменьшаем при неопределенности
-    
-    dynamic_size = base_size * kelly * vol_adj * conf_adj
-    return max(0.1, min(max_size, dynamic_size))
-
-def drawdown_protection_filter(equity: pd.Series, threshold: float = -0.15) -> bool:
-    """Фильтр защиты от просадок - возвращает False если нужно приостановить торговлю"""
-    if len(equity) < 10:
-        return True
-    
-    current_dd = max_drawdown(equity)
-    return current_dd > threshold
-
-def volatility_filter(prices: pd.Series, max_daily_vol: float = 0.08, lookback_days: int = 7) -> bool:
-    """Фильтр волатильности - возвращает False если волатильность слишком высокая"""
-    if len(prices) < lookback_days * 24:  # предполагаем часовые данные
-        return True
-    
-    returns = prices.pct_change().dropna()
-    recent_returns = returns.tail(lookback_days * 24)
-    daily_vol = recent_returns.std() * np.sqrt(24)  # аннуализация для часовых данных
-    
-    return daily_vol <= max_daily_vol
-
-def improved_min_hold_adaptive(volatility: float, base_hold: int = 24) -> int:
-    """Адаптивное время удержания позиции на основе волатильности"""
-    if volatility > 0.06:  # высокая волатильность
-        return max(12, base_hold // 2)
-    elif volatility < 0.02:  # низкая волатильность
-        return min(72, base_hold * 2)
-    else:
-        return base_hold
-
 def psi(a: pd.Series, b: pd.Series, bins: int = 20) -> float:
     a = pd.Series(a).dropna().values
     b = pd.Series(b).dropna().values
@@ -162,10 +66,8 @@ def psi(a: pd.Series, b: pd.Series, bins: int = 20) -> float:
     qs = np.quantile(a, np.linspace(0, 1, bins + 1))
     qs[-1] += 1e-12
     c_a, _ = np.histogram(a, qs); c_b, _ = np.histogram(b, qs)
-    denom_a = max(1, int(c_a.sum()))
-    denom_b = max(1, int(c_b.sum()))
-    c_a = np.clip(c_a / denom_a, 1e-9, None)
-    c_b = np.clip(c_b / denom_b, 1e-9, None)
+    c_a = np.clip(c_a / c_a.sum(), 1e-9, None)
+    c_b = np.clip(c_b / c_b.sum(), 1e-9, None)
     return float(np.sum((c_a - c_b) * np.log(c_a / c_b)))
 
 # ----------------------------- Data -----------------------------
@@ -174,6 +76,7 @@ def fetch_ohlcv_all(exchange, symbol, timeframe='15m',
     tf2min = timeframe_to_minutes(timeframe)
     ms_step = tf2min * 60_000
 
+    # якоримся к "сейчас": берём последние max_bars (+ небольшой запас)
     if since_ms is None:
         since_ms = int((pd.Timestamp.utcnow()
                         - pd.Timedelta(minutes=(max_bars + 5) * tf2min)).timestamp() * 1000)
@@ -235,50 +138,31 @@ def make_labels_binary(df_feat: pd.DataFrame, horizon_bars: int,
     y = (fwd > fee_round_trip).astype(int)
     return y
 
-# ----------------------------- CV: purged / embargo + fold-wise calibration -----------------------------
+# ----------------------------- CV: purged / embargo -----------------------------
 def purged_splits(n, n_splits=5, purge=24, embargo=12):
+    """
+    Делит индексы [0..n-1] на KFold без shuffle, затем режет хвост train (purge)
+    и ставит запретную зону после test (embargo).
+    """
     kf = KFold(n_splits=n_splits, shuffle=False)
     for tr_idx, te_idx in kf.split(np.arange(n)):
         tr_idx = np.asarray(tr_idx, dtype=int)
         te_idx = np.asarray(te_idx, dtype=int)
+        # purge: отбираем только те train-индексы, которые не ближе purge к тест-окну справа
+        # и не заходят в тест-окно слева
         tr_mask = []
         te_start, te_end = te_idx[0], te_idx[-1]
         for i in tr_idx:
             if i <= te_start - purge or i > te_end:
                 tr_mask.append(i)
         tr_mask = np.asarray(tr_mask, dtype=int)
+        # embargo: исключаем участок сразу после теста
         emb_end = min(n - 1, te_end + embargo)
         tr_mask = tr_mask[(tr_mask < te_start) | (tr_mask > emb_end)]
         yield tr_mask, te_idx
 
-def _fit_lgbm(Xtr, ytr, Xvl, yvl, params):
-    clf = LGBMClassifier(**params)
-    clf.fit(Xtr, ytr, eval_set=[(Xvl, yvl)],
-            eval_metric='binary_logloss',
-            callbacks=[lgb.early_stopping(stopping_rounds=200, verbose=False)])
-    p_val = clf.predict_proba(Xvl)[:, 1]
-    return clf, p_val
-
-def _calibrate_fold(p_val, y_val, method: str):
-    if method == "none":
-        return p_val
-    if method == "isotonic":
-        ir = IsotonicRegression(out_of_bounds="clip")
-        ir.fit(p_val, y_val.astype(float))
-        return ir.transform(p_val)
-    if method == "platt":
-        lr = LogisticRegression(max_iter=1000)
-        lr.fit(p_val.reshape(-1,1), y_val.astype(int))
-        return lr.predict_proba(p_val.reshape(-1,1))[:,1]
-    return p_val
-
-def oof_predict_lgbm_purged_foldcal(X: pd.DataFrame, y: pd.Series, n_splits=5,
-                                    purge=24, embargo=12, method="none",
-                                    random_state=RANDOM_STATE) -> pd.Series:
-    """
-    OOF вероятности с purged/embargo и калибровкой по каждому фолду (fold-wise).
-    Исключает утечку, в отличие от глобальной «на последнем окне».
-    """
+def oof_predict_lgbm_purged(X: pd.DataFrame, y: pd.Series, n_splits=5,
+                            purge=24, embargo=12, random_state=RANDOM_STATE) -> pd.Series:
     proba = pd.Series(index=X.index, dtype=float)
     params = dict(
         n_estimators=4000, learning_rate=0.03, num_leaves=127,
@@ -290,9 +174,11 @@ def oof_predict_lgbm_purged_foldcal(X: pd.DataFrame, y: pd.Series, n_splits=5,
     for tr, te in purged_splits(n, n_splits=n_splits, purge=purge, embargo=embargo):
         Xtr, ytr = X.iloc[tr], y.iloc[tr]
         Xvl, yvl = X.iloc[te], y.iloc[te]
-        clf, p_val = _fit_lgbm(Xtr, ytr, Xvl, yvl, params)
-        p_val_cal = _calibrate_fold(np.asarray(p_val), yvl.values, method)
-        proba.iloc[te] = p_val_cal
+        clf = LGBMClassifier(**params)
+        clf.fit(Xtr, ytr, eval_set=[(Xvl, yvl)],
+                eval_metric='binary_logloss',
+                callbacks=[lgb.early_stopping(stopping_rounds=200, verbose=False)])
+        proba.iloc[te] = clf.predict_proba(Xvl)[:, 1]
     return proba
 
 def baseline_auc(X: pd.DataFrame, y: pd.Series) -> float | None:
@@ -309,11 +195,43 @@ def baseline_auc(X: pd.DataFrame, y: pd.Series) -> float | None:
     p = lr.predict_proba(Xte)[:, 1]
     return roc_auc_score(yte, p)
 
+# ----------------------------- Calibration -----------------------------
+def calibrate_proba(proba: pd.Series, y: pd.Series, method: str = "none",
+                    window_frac: float = 0.2) -> pd.Series:
+    """
+    Калибрует вероятности по последнему окну (по умолчанию 20%).
+    method: 'none' | 'isotonic' | 'platt'
+    """
+    if method == "none":
+        return proba
+
+    n = len(proba)
+    if n < 1000:
+        return proba  # мало для устойчивой калибровки
+
+    cut = int(n * (1 - window_frac))
+    p_win = proba.iloc[cut:]
+    y_win = y.iloc[cut:]
+
+    if method == "isotonic":
+        ir = IsotonicRegression(out_of_bounds="clip")
+        ir.fit(p_win.values, y_win.values.astype(float))
+        return pd.Series(ir.transform(proba.values), index=proba.index, dtype=float)
+
+    if method == "platt":
+        lr = LogisticRegression(max_iter=1000)
+        lr.fit(p_win.values.reshape(-1, 1), y_win.values.astype(int))
+        p_all = lr.predict_proba(proba.values.reshape(-1, 1))[:, 1]
+        return pd.Series(p_all, index=proba.index, dtype=float)
+
+    return proba
+
 # ----------------------------- Position Logic (Hysteresis) -----------------------------
 def positions_hysteresis(proba: pd.Series,
                          enter_long: float, exit_long: float,
                          enter_short: float, exit_short: float,
                          min_hold: int = 24, cooldown: int = 12) -> pd.Series:
+    """Состояния -1/0/1 с гистерезисом, min_hold и cooldown после выхода."""
     state, hold, cd = 0, 0, 0
     pos = []
     for p in proba.values:
@@ -343,194 +261,21 @@ def positions_hysteresis(proba: pd.Series,
         pos.append(state)
     return pd.Series(pos, index=proba.index, dtype=int)
 
-def positions_hysteresis_dynamic_optimized(proba: pd.Series, prices: pd.Series,
-                                          enter_long: float, exit_long: float,
-                                          enter_short: float, exit_short: float,
-                                          min_hold: int = 24, cooldown: int = 12,
-                                          use_dynamic_sizing: bool = True,
-                                          max_position_size: float = 1.0,
-                                          dd_protection_threshold: float = -0.15) -> tuple:
-    """
-    ОПТИМИЗИРОВАННАЯ версия с динамическим управлением позицией
-    """
-    state, hold, cd = 0, 0, 0
-    pos, pos_sizes, protection_flags = [], [], []
-    
-    # Предвычисляем все возвраты
-    returns_history = prices.pct_change().dropna()
-    n_bars = len(proba)
-    
-    # Предвычисляем волатильность для каждого периода (каждые 20 баров)
-    vol_cache = {}
-    for i in range(0, n_bars, 20):
-        end_idx = min(i + 60, len(returns_history))
-        if end_idx > 60:
-            vol_cache[i] = returns_history.iloc[max(0, end_idx-60):end_idx].std()
-        else:
-            vol_cache[i] = 0.02  # значение по умолчанию
-    
-    # Упрощенное отслеживание equity для защиты от просадок
-    equity_simple = 1.0
-    equity_history = []
-    protection_check_interval = 10  # проверяем защиту каждые 10 баров
-    
-    for i, p in enumerate(proba.values):
-        # Адаптивный min_hold (проверяем волатильность реже)
-        vol_key = (i // 20) * 20
-        if vol_key in vol_cache:
-            adaptive_min_hold = improved_min_hold_adaptive(vol_cache[vol_key], min_hold)
-        else:
-            adaptive_min_hold = min_hold
-        
-        # Проверяем защиту от просадок реже
-        if i % protection_check_interval == 0 and len(equity_history) > 10:
-            current_dd = max_drawdown(pd.Series(equity_history[-50:]))  # только последние 50 значений
-            protection_active = current_dd < dd_protection_threshold
-        else:
-            protection_active = protection_flags[-1] if protection_flags else False
-        
-        protection_flags.append(protection_active)
-        
-        # Основная логика позиций (упрощенная)
-        if cd > 0:
-            if state != 0:
-                hold += 1
-                if state == 1 and hold >= adaptive_min_hold and (p < exit_long or protection_active):
-                    state, hold, cd = 0, 0, cooldown
-                elif state == -1 and hold >= adaptive_min_hold and (p > exit_short or protection_active):
-                    state, hold, cd = 0, 0, cooldown
-            else:
-                cd -= 1
-        else:
-            if state == 0 and not protection_active:
-                if p > enter_long:
-                    state, hold = 1, 0
-                elif p < enter_short:
-                    state, hold = -1, 0
-            elif state == 1:
-                hold += 1
-                if hold >= adaptive_min_hold and (p < exit_long or protection_active):
-                    state, hold, cd = 0, 0, cooldown
-            elif state == -1:
-                hold += 1
-                if hold >= adaptive_min_hold and (p > exit_short or protection_active):
-                    state, hold, cd = 0, 0, cooldown
-        
-        # Упрощенный размер позиции
-        if use_dynamic_sizing and state != 0 and i > 30:
-            # Используем предвычисленную волатильность и упрощенный Kelly
-            recent_vol = vol_cache.get(vol_key, 0.02)
-            vol_adj = min(1.5, max(0.5, 0.02 / recent_vol)) if recent_vol > 0 else 1.0
-            
-            # Упрощенная корректировка на уверенность
-            if p > 0.7 or p < 0.3:
-                conf_adj = 1.1
-            elif 0.45 < p < 0.55:
-                conf_adj = 0.7
-            else:
-                conf_adj = 1.0
-                
-            pos_size = min(max_position_size, 0.3 * vol_adj * conf_adj)  # упрощенная формула
-        else:
-            pos_size = 1.0 if state != 0 else 0.0
-        
-        pos.append(state)
-        pos_sizes.append(pos_size * abs(state) if state != 0 else 0.0)
-        
-        # Упрощенное обновление equity
-        if i > 0 and i < len(returns_history):
-            if len(pos) > 1:
-                prev_pos = pos[-2] * (pos_sizes[-2] if len(pos_sizes) > 1 else 1.0)
-                current_return = returns_history.iloc[i]
-                equity_simple *= (1 + prev_pos * current_return * 0.1)  # масштабируем для стабильности
-            equity_history.append(equity_simple)
-    
-    pos_series = pd.Series(pos, index=proba.index, dtype=int)
-    size_series = pd.Series(pos_sizes, index=proba.index, dtype=float)
-    protection_series = pd.Series(protection_flags, index=proba.index, dtype=bool)
-    
-    return pos_series, size_series, protection_series
-
 # ----------------------------- Backtests -----------------------------
 def _align_by_open_next(df: pd.DataFrame, proba: pd.Series):
+    """
+    Выравниваем proba к df, строим доходность по open[t+1]/open[t]-1
+    Возвращает: ret(series at t), pos_index(Index at t) и ссылку на df
+    """
     df = df[['o','h','l','c']].copy()
     proba = proba.dropna()
     idx = df.index.intersection(proba.index)
     df = df.loc[idx]
     proba = proba.loc[idx]
     o = df['o'].astype(float)
-    ret = (o.shift(-1) / o - 1.0).dropna()
-    proba = proba.loc[ret.index]
+    ret = (o.shift(-1) / o - 1.0).dropna()   # ретёрн интервала [t -> t+1]
+    proba = proba.loc[ret.index]             # решение на close[t], исполнение на open[t+1]
     return df, ret, proba
-
-def backtest_hysteresis_dynamic(df: pd.DataFrame, proba: pd.Series, tf: str,
-                               enter_long_q=0.85, exit_long_q=0.60,  # улучшенные пороги
-                               enter_short_q=0.15, exit_short_q=0.35,
-                               min_hold=24, cooldown=12,
-                               use_dynamic_sizing=True, max_position_size=0.8,
-                               dd_protection_threshold=-0.15,
-                               fee_per_side=FEE_PER_SIDE, slippage_per_side=SLIPPAGE_PER_SIDE) -> dict:
-    """Улучшенный бэктест с динамическим управлением позицией и защитой от просадок"""
-    df, ret, proba = _align_by_open_next(df, proba)
-    if len(ret) < 10:
-        return dict(sharpe=0.0, cagr=0.0, max_dd=0.0, n_bars=0, turns=0,
-                    long_share=0.0, short_share=0.0, neutral_share=1.0,
-                    thresholds=dict(enter_long=np.nan, exit_long=np.nan,
-                                    enter_short=np.nan, exit_short=np.nan),
-                    params=dict(enter_long_q=enter_long_q, exit_long_q=exit_long_q,
-                                enter_short_q=enter_short_q, exit_short_q=exit_short_q,
-                                min_hold=min_hold, cooldown=cooldown),
-                    equity=pd.Series(dtype=float), ret=pd.Series(dtype=float), pos=pd.Series(dtype=int))
-
-    q = proba.quantile
-    enter_long  = float(q(enter_long_q))
-    exit_long   = float(q(exit_long_q))
-    enter_short = float(q(enter_short_q))
-    exit_short  = float(q(exit_short_q))
-
-    # Используем ОПТИМИЗИРОВАННУЮ логику позиций
-    pos_raw, pos_sizes, protection_flags = positions_hysteresis_dynamic_optimized(
-        proba, df['c'], enter_long, exit_long, enter_short, exit_short,
-        min_hold=min_hold, cooldown=cooldown,
-        use_dynamic_sizing=use_dynamic_sizing,
-        max_position_size=max_position_size,
-        dd_protection_threshold=dd_protection_threshold
-    )
-    
-    # Позиции с учетом размера (для исполнения)
-    pos_exec = (pos_raw * pos_sizes).shift(1).reindex(ret.index).fillna(0)
-
-    turns = pos_exec.diff().abs().fillna(0)
-    cost_per_side = float(fee_per_side + slippage_per_side)
-    costs = turns * cost_per_side
-
-    strat_ret = pos_exec * ret - costs
-    strat_ret = strat_ret.dropna()
-    eq = (1.0 + strat_ret).cumprod()
-
-    bpy = bars_per_year(tf)
-    sharpe = (strat_ret.mean() / (strat_ret.std() + 1e-12)) * np.sqrt(bpy) if len(strat_ret) else 0.0
-    if len(eq) >= 2:
-        years = len(strat_ret) / bpy
-        cagr = eq.iloc[-1] ** (1/years) - 1.0 if years > 0 else 0.0
-    else:
-        cagr = 0.0
-    mdd = max_drawdown(eq)
-
-    return dict(
-        sharpe=float(sharpe), cagr=float(cagr), max_dd=float(mdd),
-        n_bars=int(len(strat_ret)), turns=int(turns.sum()),
-        long_share=float((pos_raw == 1).mean()) if len(pos_raw) else 0.0,
-        short_share=float((pos_raw == -1).mean()) if len(pos_raw) else 0.0,
-        neutral_share=float((pos_raw == 0).mean()) if len(pos_raw) else 1.0,
-        thresholds=dict(enter_long=enter_long, exit_long=exit_long,
-                        enter_short=enter_short, exit_short=exit_short),
-        params=dict(enter_long_q=enter_long_q, exit_long_q=exit_long_q,
-                    enter_short_q=enter_short_q, exit_short_q=exit_short_q,
-                    min_hold=min_hold, cooldown=cooldown,
-                    use_dynamic_sizing=use_dynamic_sizing, max_position_size=max_position_size),
-        equity=eq, ret=strat_ret, pos=pos_raw, pos_sizes=pos_sizes, protection_flags=protection_flags
-    )
 
 def backtest_hysteresis_open_next(df: pd.DataFrame, proba: pd.Series, tf: str,
                                   enter_long_q=0.90, exit_long_q=0.70,
@@ -556,6 +301,7 @@ def backtest_hysteresis_open_next(df: pd.DataFrame, proba: pd.Series, tf: str,
 
     pos_raw = positions_hysteresis(proba, enter_long, exit_long, enter_short, exit_short,
                                    min_hold=min_hold, cooldown=cooldown)
+    # исполнение на open[t+1] => позиция действует на ретёрн ret[t]
     pos_exec = pos_raw.shift(1).reindex(ret.index).fillna(0).astype(int)
 
     turns = pos_exec.diff().abs().fillna(0)
@@ -634,76 +380,13 @@ def backtest_hysteresis_fixed_thresholds_open(df: pd.DataFrame, proba: pd.Series
     )
 
 # ----------------------------- Threshold search -----------------------------
-def search_thresholds_dynamic(proba: pd.Series, df_feat: pd.DataFrame, tf: str,
-                             turnover_cap=DEFAULT_TURNOVER_CAP, max_dd_cap=0.30,  # более строгий лимит
-                             use_dynamic_sizing=True,
-                             fee_per_side=FEE_PER_SIDE, slippage_per_side=SLIPPAGE_PER_SIDE):
-    """Улучшенный поиск порогов с акцентом на снижение просадок и повышение Sharpe"""
-    # Более консервативные и лучше сбалансированные сетки
-    grid_enter = [0.82, 0.85, 0.88]            # Уменьшили количество для ускорения
-    grid_exit  = [0.55, 0.60, 0.65]            # Больший спред с входом
-    grid_enter_s = [0.18, 0.15, 0.12]          # Уменьшили количество для ускорения
-    grid_exit_s  = [0.35, 0.40, 0.45]          # Больший спред с входом
-    grid_hold = [16, 24, 32]                    # Меньше вариантов, фокус на оптимальных
-    cooldowns = [12, 24]                        # Уменьшили для ускорения
-
-    best, best_stats = None, None
-    best_loose, best_loose_stats = None, None
-
-    # Подсчет общего количества итераций для прогресса
-    total_iterations = len(grid_enter) * len(grid_exit) * len(grid_enter_s) * len(grid_exit_s) * len(grid_hold) * len(cooldowns)
-    current_iteration = 0
-    
-    print(f"🔍 Поиск оптимальных порогов: {total_iterations} комбинаций...")
-    
-    for el in grid_enter:
-        for xl in grid_exit:
-            if xl >= el: continue
-            for es in grid_enter_s:
-                for xs in grid_exit_s:
-                    if xs <= es: continue
-                    for mh in grid_hold:
-                        for cd in cooldowns:
-                            current_iteration += 1
-                            
-                            # Показываем прогресс каждые 10 итераций
-                            if current_iteration % 10 == 0:
-                                progress = (current_iteration / total_iterations) * 100
-                                print(f"  ⏳ Прогресс: {progress:.1f}% ({current_iteration}/{total_iterations})")
-                            
-                            stats = backtest_hysteresis_dynamic(
-                                df_feat, proba, tf,
-                                enter_long_q=el, exit_long_q=xl,
-                                enter_short_q=es, exit_short_q=xs,
-                                min_hold=mh, cooldown=cd,
-                                use_dynamic_sizing=use_dynamic_sizing,
-                                max_position_size=0.8,  # Консервативный размер
-                                dd_protection_threshold=-0.15,
-                                fee_per_side=fee_per_side, slippage_per_side=slippage_per_side
-                            )
-                            if stats['n_bars'] == 0: continue
-                            tp_bar = stats['turns'] / max(1, stats['n_bars'])
-                            
-                            # Комбинированный скор: Sharpe важнее, но с учетом просадки
-                            combined_score = stats['sharpe'] * (1 + stats['max_dd'])  # max_dd отрицательный
-                            
-                            if (best_loose is None) or (combined_score > best_loose_stats.get('combined_score', -999)):
-                                stats['combined_score'] = combined_score
-                                best_loose, best_loose_stats = (el, xl, es, xs, mh, cd), stats
-                                print(f"    ✨ Новый лучший (без ограничений): Sharpe={stats['sharpe']:.3f}, DD={stats['max_dd']:.1%}")
-                            
-                            if tp_bar <= turnover_cap and stats['max_dd'] >= -max_dd_cap:
-                                if (best is None) or (combined_score > best_stats.get('combined_score', -999)):
-                                    stats['combined_score'] = combined_score
-                                    best, best_stats = (el, xl, es, xs, mh, cd), stats
-                                    print(f"    🎯 Новый лучший (с ограничениями): Sharpe={stats['sharpe']:.3f}, DD={stats['max_dd']:.1%}")
-    
-    print("✅ Поиск порогов завершен!")
-    return best, best_stats, best_loose, best_loose_stats
-
-def search_thresholds_grid(proba: pd.Series, df_feat: pd.DataFrame, tf: str,
-                           turnover_cap=DEFAULT_TURNOVER_CAP, max_dd_cap=DEFAULT_MAX_DD_CAP,
-                           fee_per_side=FEE_PER_SIDE, slippage_per_side=SLIPPAGE_PER_SIDE):
+def search_thresholds(proba: pd.Series, df_feat: pd.DataFrame, tf: str,
+                      turnover_cap=DEFAULT_TURNOVER_CAP, max_dd_cap=DEFAULT_MAX_DD_CAP,
+                      fee_per_side=FEE_PER_SIDE, slippage_per_side=SLIPPAGE_PER_SIDE):
+    """
+    Перебор порогов + min_hold/cooldown.
+    Возвращает лучший по Sharpe в cap и лучший без cap (loose).
+    """
     grid_enter = [0.80, 0.85, 0.90, 0.93]
     grid_exit  = [0.60, 0.65, 0.70]
     grid_enter_s = [0.20, 0.15, 0.10, 0.07]
@@ -716,10 +399,12 @@ def search_thresholds_grid(proba: pd.Series, df_feat: pd.DataFrame, tf: str,
 
     for el in grid_enter:
         for xl in grid_exit:
-            if xl >= el: continue
+            if xl >= el:
+                continue
             for es in grid_enter_s:
                 for xs in grid_exit_s:
-                    if xs <= es: continue
+                    if xs <= es:
+                        continue
                     for mh in grid_hold:
                         for cd in cooldowns:
                             stats = backtest_hysteresis_open_next(
@@ -729,70 +414,40 @@ def search_thresholds_grid(proba: pd.Series, df_feat: pd.DataFrame, tf: str,
                                 min_hold=mh, cooldown=cd,
                                 fee_per_side=fee_per_side, slippage_per_side=slippage_per_side
                             )
-                            if stats['n_bars'] == 0: continue
+                            if stats['n_bars'] == 0:
+                                continue
                             tp_bar = stats['turns'] / max(1, stats['n_bars'])
+                            # лучший без ограничений
                             if (best_loose is None) or (stats['sharpe'] > best_loose_stats['sharpe']):
                                 best_loose, best_loose_stats = (el, xl, es, xs, mh, cd), stats
+                            # ограничения по обороту и MaxDD
                             if tp_bar <= turnover_cap and stats['max_dd'] >= -max_dd_cap:
                                 if (best is None) or (stats['sharpe'] > best_stats['sharpe']):
                                     best, best_stats = (el, xl, es, xs, mh, cd), stats
     return best, best_stats, best_loose, best_loose_stats
 
-def search_thresholds_bayes(proba: pd.Series, df_feat: pd.DataFrame, tf: str,
-                            turnover_cap=DEFAULT_TURNOVER_CAP, max_dd_cap=DEFAULT_MAX_DD_CAP,
-                            n_calls=40,
-                            fee_per_side=FEE_PER_SIDE, slippage_per_side=SLIPPAGE_PER_SIDE):
-    if not _HAS_SKOPT:
-        print("WARN: skopt не найден — использую grid-поиск.")
-        return search_thresholds_grid(proba, df_feat, tf, turnover_cap, max_dd_cap, fee_per_side, slippage_per_side)
-
-    def objective(params):
-        el, xl, es, xs, mh, cd = params
-        stats = backtest_hysteresis_open_next(
-            df_feat, proba, tf,
-            enter_long_q=el, exit_long_q=xl, enter_short_q=es, exit_short_q=xs,
-            min_hold=int(mh), cooldown=int(cd),
-            fee_per_side=fee_per_side, slippage_per_side=slippage_per_side
-        )
-        if stats["n_bars"] == 0 or stats["max_dd"] < -max_dd_cap:
-            return 1e3
-        tp_bar = stats["turns"]/max(1,stats["n_bars"])
-        penalty = 50.0 * max(0.0, tp_bar - turnover_cap)
-        return float(-(stats["sharpe"]) + penalty)
-
-    space = [
-        Real(0.75, 0.95, name="enter_long_q"),
-        Real(0.55, 0.75, name="exit_long_q"),
-        Real(0.05, 0.25, name="enter_short_q"),
-        Real(0.25, 0.45, name="exit_short_q"),
-        Integer(12, 72,   name="min_hold"),
-        Integer(2,  48,   name="cooldown"),
-    ]
-    res = gp_minimize(objective, space, n_calls=n_calls, random_state=RANDOM_STATE)
-    el, xl, es, xs, mh, cd = res.x
-    best_stats = backtest_hysteresis_open_next(
-        df_feat, proba, tf, el, xl, es, xs, int(mh), int(cd),
-        fee_per_side=fee_per_side, slippage_per_side=slippage_per_side
-    )
-    # для "loose" вернём то же (можно добавить пост-грid добор при желании)
-    return (el, xl, es, xs, int(mh), int(cd)), best_stats, (el, xl, es, xs, int(mh), int(cd)), best_stats
-
 # ----------------------------- Trades (open-exec) & JSON -----------------------------
 def extract_trades_from_pos_open(df: pd.DataFrame, pos_exec: pd.Series,
                                  fee_per_side=FEE_PER_SIDE, slippage_per_side=SLIPPAGE_PER_SIDE) -> pd.DataFrame:
+    """
+    df: ожидается ['o','c'] с одинаковым индексом с pos_exec.
+    Вход/выход по open ценам. Издержки мультипликативные на вход и на выход.
+    """
     df = df[['o','c']].copy()
     idx = df.index.intersection(pos_exec.index)
     if len(idx) == 0:
         return pd.DataFrame(columns=['side','entry_ts','exit_ts','entry_price','exit_price','gross_ret','net_ret','net_pct','bars','win'])
 
     o = df.loc[idx, 'o'].astype(float)
+    c = df.loc[idx, 'c'].astype(float)  # для справки можно хранить
     ps = pos_exec.loc[idx].astype(int)
 
     cost_side = float(fee_per_side + slippage_per_side)
-    trades = []; cur = None
+    trades = []; cur = None  # {'side': 1/-1, 'entry_ts', 'entry_price', 'entry_i'}
 
     for i, ts in enumerate(idx):
-        p = int(ps.iloc[i]); price_open = float(o.iloc[i])
+        p = int(ps.iloc[i])
+        price_open = float(o.iloc[i])
 
         if cur is None:
             if p != 0:
@@ -802,29 +457,39 @@ def extract_trades_from_pos_open(df: pd.DataFrame, pos_exec: pd.Series,
         if p == cur["side"]:
             continue
 
-        side = cur["side"]; entry_price = float(cur["entry_price"])
-        exit_ts = ts; exit_price = price_open
+        # закрываем позицию по текущему open
+        side = cur["side"]
+        entry_price = float(cur["entry_price"])
+        exit_ts = ts
+        exit_price = price_open
 
-        gross = (exit_price / entry_price - 1.0) if side == 1 else (entry_price / exit_price - 1.0)
-        net = (1.0 + gross) * (1.0 - cost_side)**2 - 1.0
+        if side == 1:
+            gross = exit_price / entry_price - 1.0
+        else:
+            gross = entry_price / exit_price - 1.0
+
+        net = (1.0 + gross) * (1.0 - cost_side) * (1.0 - cost_side) - 1.0
         bars_held = i - int(cur["entry_i"])
 
         trades.append(dict(
             side="long" if side == 1 else "short",
             entry_ts=cur["entry_ts"], exit_ts=exit_ts,
             entry_price=entry_price, exit_price=exit_price,
-            gross_ret=gross, net_ret=net, net_pct=net*100.0, bars=bars_held
+            gross_ret=gross, net_ret=net, net_pct=net*100.0,
+            bars=bars_held
         ))
 
+        # flip, если нужно
         cur = None
         if p != 0:
             cur = dict(side=p, entry_ts=ts, entry_price=price_open, entry_i=i)
 
+    # если осталась открытая позиция — закроем на последнем доступном open (для отчёта)
     if cur is not None and len(idx):
         ts = idx[-1]; price_open = float(o.iloc[-1])
         side = cur["side"]; entry_price = float(cur["entry_price"])
         gross = (price_open / entry_price - 1.0) if side == 1 else (entry_price / price_open - 1.0)
-        net = (1.0 + gross) * (1.0 - cost_side)**2 - 1.0
+        net = (1.0 + gross) * (1.0 - cost_side) * (1.0 - cost_side) - 1.0
         bars_held = len(idx) - 1 - int(cur["entry_i"])
         trades.append(dict(
             side="long" if side == 1 else "short",
@@ -870,6 +535,7 @@ def load_cashflows(path: str) -> pd.Series:
     return s
 
 def align_cashflows_to_index(cflows: pd.Series, bar_index: pd.Index) -> pd.Series:
+    """Каждый кэшфлоу — на ближайший СЛЕДУЮЩИЙ бар (если позже последнего — игнор)."""
     if cflows is None or cflows.empty or len(bar_index) == 0:
         return pd.Series(dtype=float)
     mapped = {}
@@ -877,7 +543,7 @@ def align_cashflows_to_index(cflows: pd.Series, bar_index: pd.Index) -> pd.Serie
         if ts in bar_index:
             mapped[ts] = mapped.get(ts, 0.0) + float(amt)
         else:
-            pos = bar_index.searchsorted(ts)
+            pos = bar_index.searchsorted(ts)  # первый bar >= ts
             if pos < len(bar_index):
                 key = bar_index[pos]
                 mapped[key] = mapped.get(key, 0.0) + float(amt)
@@ -886,6 +552,10 @@ def align_cashflows_to_index(cflows: pd.Series, bar_index: pd.Index) -> pd.Serie
     return pd.Series(mapped).sort_index()
 
 def equity_with_cashflows(strat_ret: pd.Series, initial_capital: float, cflows_on_bars: pd.Series) -> tuple:
+    """
+    Денежное эквити с депозитами/выводами. Кэшфлоу применяется ПЕРЕД доходностью бара.
+    Возвращает: (series, deposits_sum, withdrawals_sum, final_value, profit, roi)
+    """
     value = float(initial_capital)
     vals = []
     for ts in strat_ret.index:
@@ -940,7 +610,7 @@ def summarize_trades(trades: pd.DataFrame, timeframe: str) -> str:
 
 # ----------------------------- main -----------------------------
 def main():
-    parser = argparse.ArgumentParser(description="AI crypto bot (LGBM, purged CV + fold-wise calibration, open-next exec, hysteresis, thresholds, trades JSON, cashflows, last-window/OOT)")
+    parser = argparse.ArgumentParser(description="AI crypto bot (LGBM, purged CV, open-next exec, hysteresis, thresholds, trades JSON, cashflows, last-window/OOT)")
     parser.add_argument("--symbol", type=str, default=DEFAULT_SYMBOL)
     parser.add_argument("--timeframe", type=str, default=DEFAULT_TIMEFRAME)
     parser.add_argument("--max-bars", type=int, default=DEFAULT_MAX_BARS)
@@ -951,18 +621,10 @@ def main():
     parser.add_argument("--initial-capital", type=float, default=10_000.0, help="стартовый капитал для денежного эквити")
     parser.add_argument("--cashflows", type=str, default="cashflows.json", help="путь к JSON с кэшфлоу [{'ts': 'YYYY-MM-DD HH:MM:SS', 'amount': 1000}, ...]")
     parser.add_argument("--last-days", type=int, default=DEFAULT_LAST_DAYS, help="оценить результат только за последние N дней (0=выкл)")
-
     parser.add_argument("--cv-splits", type=int, default=5)
     parser.add_argument("--cv-purge", type=int, default=None, help="purge bars (по умолчанию = horizon)")
     parser.add_argument("--cv-embargo", type=int, default=None, help="embargo bars (по умолчанию = horizon//2)")
-    parser.add_argument("--calibrate", type=str, default="none", choices=["none","isotonic","platt"], help="fold-wise калибровка вероятностей")
-
-    parser.add_argument("--search", type=str, default="dynamic", choices=["grid","bayes","dynamic"], help="поиск порогов (по умолчанию: dynamic - улучшенный алгоритм)")
-    parser.add_argument("--use-dynamic-sizing", action="store_true", default=True, help="использовать динамическое управление размером позиции")
-    parser.add_argument("--max-position-size", type=float, default=0.8, help="максимальный размер позиции (доля от капитала)")
-    parser.add_argument("--dd-protection", type=float, default=-0.15, help="порог защиты от просадок")
-    parser.add_argument("--bayes-calls", type=int, default=40, help="итерации для bayes-поиска (skopt)")
-
+    parser.add_argument("--calibrate", type=str, default="none", choices=["none","isotonic","platt"], help="калибровка вероятностей по последнему окну")
     parser.add_argument("--plot", action="store_true")
     args = parser.parse_args()
 
@@ -997,15 +659,18 @@ def main():
     if auc is not None:
         print(f"Baseline LogisticRegression AUC (last 20%): {auc:.3f}")
 
-    # OOF-прогноз LightGBM (purged/embargo) + FOLD-WISE CALIBRATION
-    print(f"Training LightGBM OOF (purged CV) ... purge={purge}, embargo={embargo}, splits={args.cv_splits}, calibration={args.calibrate}")
-    proba = oof_predict_lgbm_purged_foldcal(
-        X, y, n_splits=args.cv_splits, purge=purge, embargo=embargo, method=args.calibrate, random_state=RANDOM_STATE
-    )
+    # OOF-прогноз LightGBM (purged/embargo)
+    print(f"Training LightGBM (purged CV) ... purge={purge}, embargo={embargo}, splits={args.cv_splits}")
+    proba = oof_predict_lgbm_purged(X, y, n_splits=args.cv_splits, purge=purge, embargo=embargo, random_state=RANDOM_STATE)
     print("Proba ready. Describe:\n", proba.describe())
 
+    # Калибровка
+    proba_cal = calibrate_proba(proba, y, method=args.calibrate, window_frac=0.2)
+    if args.calibrate != "none":
+        print(f"Applied calibration: {args.calibrate}")
+
     # Сглаживание вероятностей
-    proba_s = proba.ewm(span=args.smooth_span, adjust=False).mean() if (args.smooth_span and args.smooth_span > 1) else proba
+    proba_s = proba_cal.ewm(span=args.smooth_span, adjust=False).mean() if (args.smooth_span and args.smooth_span > 1) else proba_cal
     if args.smooth_span and args.smooth_span > 1:
         print(f"Applied EMA smoothing span={args.smooth_span}. Proba_smoothed describe:\n", proba_s.describe())
 
@@ -1018,27 +683,11 @@ def main():
         pass
 
     # ===== Подбор порогов (на всей истории)
-    if args.search == "bayes":
-        best, best_stats, best_loose, best_loose_stats = search_thresholds_bayes(
-            proba_s, df_feat, args.timeframe,
-            turnover_cap=args.turnover_cap, max_dd_cap=args.max_dd_cap,
-            n_calls=args.bayes_calls,
-            fee_per_side=FEE_PER_SIDE, slippage_per_side=SLIPPAGE_PER_SIDE
-        )
-    elif args.search == "dynamic":
-        print("🚀 Используем улучшенный алгоритм с динамическим размером позиции и защитой от просадок...")
-        best, best_stats, best_loose, best_loose_stats = search_thresholds_dynamic(
-            proba_s, df_feat, args.timeframe,
-            turnover_cap=args.turnover_cap, max_dd_cap=0.30,  # более строгий лимит
-            use_dynamic_sizing=args.use_dynamic_sizing,
-            fee_per_side=FEE_PER_SIDE, slippage_per_side=SLIPPAGE_PER_SIDE
-        )
-    else:
-        best, best_stats, best_loose, best_loose_stats = search_thresholds_grid(
-            proba_s, df_feat, args.timeframe,
-            turnover_cap=args.turnover_cap, max_dd_cap=args.max_dd_cap,
-            fee_per_side=FEE_PER_SIDE, slippage_per_side=SLIPPAGE_PER_SIDE
-        )
+    best, best_stats, best_loose, best_loose_stats = search_thresholds(
+        proba_s, df_feat, args.timeframe,
+        turnover_cap=args.turnover_cap, max_dd_cap=args.max_dd_cap,
+        fee_per_side=FEE_PER_SIDE, slippage_per_side=SLIPPAGE_PER_SIDE
+    )
 
     if best is None and best_loose is None:
         print("\nНе удалось подобрать пороги (в т.ч. без ограничений).")
@@ -1056,6 +705,7 @@ def main():
         print(f"Shares (L/S/F): {stats['long_share']:.2%} / {stats['short_share']:.2%} / {stats['neutral_share']:.2%}")
         print(f"Sharpe: {stats['sharpe']:.2f}, CAGR: {stats['cagr']:.2%}, MaxDD: {stats['max_dd']:.2%}")
 
+        # График и бенчмарк
         if args.plot and len(stats['equity']):
             plt.figure(figsize=(10,5))
             stats['equity'].plot(label='Strategy')
@@ -1064,9 +714,11 @@ def main():
             plt.legend(); plt.title(f"Equity (OOF · open-next){' · LOOSE' if loose_flag else ''} {args.symbol} {args.timeframe}")
             plt.grid(True, alpha=0.3); plt.tight_layout(); plt.show()
 
+        # Сохранить equity/ret/pos
         out = pd.DataFrame({'equity': stats['equity'], 'ret': stats['ret'], 'pos': stats['pos']})
         out.to_csv("backtest_oof_results.csv"); print("Saved: backtest_oof_results.csv")
 
+        # Сохранить thresholds для live/paper
         to_save = {
             "saved_at": datetime.now(timezone.utc).isoformat(),
             "symbol": args.symbol,
@@ -1076,8 +728,6 @@ def main():
             "turnover_cap": args.turnover_cap,
             "max_dd_cap": args.max_dd_cap,
             "calibration": args.calibrate,
-            "search": args.search,
-            "bayes_calls": args.bayes_calls if args.search=="bayes" else None,
             "quantiles": {"enter_long_q": el, "exit_long_q": xl, "enter_short_q": es, "exit_short_q": xs},
             "thresholds": stats["thresholds"],
             "min_hold": mh,
@@ -1090,6 +740,7 @@ def main():
             json.dump(to_save, f, indent=2)
         print("Saved: best_thresholds.json")
 
+        # --- Все сделки (CSV + JSON) по open-исполнению ---
         pos_exec = stats['pos'].shift(1).reindex(df_feat.index).fillna(0).astype(int)
         trades = extract_trades_from_pos_open(df_feat[['o','c']], pos_exec, FEE_PER_SIDE, SLIPPAGE_PER_SIDE)
         trades.to_csv("trades_all.csv", index=False); print("Saved: trades_all.csv")
@@ -1098,6 +749,8 @@ def main():
         print("\n=== Trade summary ===")
         print(summarize_trades(trades, args.timeframe))
 
+        # --- Денежное эквити с депозитами/выводами ---
+        # Собираем ретёрны стратегии в тех же временных точках, где pos_exec определён
         o = df_feat['o'].reindex(pos_exec.index).astype(float)
         ret_bar = (o.shift(-1) / o - 1.0).dropna()
         pos_e = pos_exec.reindex(ret_bar.index).fillna(0).astype(int)
@@ -1126,6 +779,7 @@ def main():
         print("\nSaved: equity_cashflow.csv, cashflow_summary.json")
         print(f"Cashflow-adjusted: initial={args.initial_capital:.2f}, deposits={dep:.2f}, withdrawals={wd:.2f} -> final={final_value:.2f}, profit={profit:.2f} (ROI {roi*100:.2f}%)")
 
+    # Печать/сохранение для лучшего варианта
     if best is not None:
         (el, xl, es, xs, mh, cd) = best
         save_common_outputs(best_stats, el, xl, es, xs, mh, cd, loose_flag=False)
@@ -1137,30 +791,14 @@ def main():
     if args.last_days and args.last_days > 0:
         cutoff = df_feat.index.max() - pd.Timedelta(days=args.last_days)
 
+        # 1) Калибровка порогов только по истории ДО окна
         proba_hist = proba_s.loc[proba_s.index <= cutoff]
         feat_hist  = df_feat.loc[df_feat.index <= cutoff]
-
-        if args.search == "bayes":
-            best_hist, stats_hist, best_loose_hist, stats_loose_hist = search_thresholds_bayes(
-                proba_hist, feat_hist, args.timeframe,
-                turnover_cap=args.turnover_cap, max_dd_cap=args.max_dd_cap,
-                n_calls=args.bayes_calls,
-                fee_per_side=FEE_PER_SIDE, slippage_per_side=SLIPPAGE_PER_SIDE
-            )
-        elif args.search == "dynamic":
-            best_hist, stats_hist, best_loose_hist, stats_loose_hist = search_thresholds_dynamic(
-                proba_hist, feat_hist, args.timeframe,
-                turnover_cap=args.turnover_cap, max_dd_cap=0.30,
-                use_dynamic_sizing=args.use_dynamic_sizing,
-                fee_per_side=FEE_PER_SIDE, slippage_per_side=SLIPPAGE_PER_SIDE
-            )
-        else:
-            best_hist, stats_hist, best_loose_hist, stats_loose_hist = search_thresholds_grid(
-                proba_hist, feat_hist, args.timeframe,
-                turnover_cap=args.turnover_cap, max_dd_cap=args.max_dd_cap,
-                fee_per_side=FEE_PER_SIDE, slippage_per_side=SLIPPAGE_PER_SIDE
-            )
-
+        best_hist, stats_hist, best_loose_hist, stats_loose_hist = search_thresholds(
+            proba_hist, feat_hist, args.timeframe,
+            turnover_cap=args.turnover_cap, max_dd_cap=args.max_dd_cap,
+            fee_per_side=FEE_PER_SIDE, slippage_per_side=SLIPPAGE_PER_SIDE
+        )
         if best_hist is None and best_loose_hist is None:
             print(f"\n[Last {args.last_days}d] Не удалось откалибровать пороги на истории до окна.")
         else:
@@ -1171,6 +809,7 @@ def main():
                 el, xl, es, xs, mh, cd = best_loose_hist
                 th = stats_loose_hist["thresholds"]
 
+            # 2) Тест только в окне (фиксированные thresholds!)
             proba_last = proba_s.loc[proba_s.index > cutoff]
             feat_last  = df_feat.loc[df_feat.index > cutoff]
             stats_last = backtest_hysteresis_fixed_thresholds_open(
@@ -1184,6 +823,7 @@ def main():
                   f"{stats_last['long_share']:.1%}/{stats_last['short_share']:.1%}/{stats_last['neutral_share']:.1%}")
             print(f"Sharpe: {stats_last['sharpe']:.2f}, CAGR: {stats_last['cagr']:.2%}, MaxDD: {stats_last['max_dd']:.2%}")
 
+            # Сделки последнего окна
             pos_exec_last = stats_last['pos'].shift(1).reindex(feat_last.index).fillna(0).astype(int)
             trades_last = extract_trades_from_pos_open(feat_last[['o','c']], pos_exec_last, FEE_PER_SIDE, SLIPPAGE_PER_SIDE)
             trades_last.to_csv("trades_last_window.csv", index=False)
@@ -1192,6 +832,7 @@ def main():
             print("\n--- Trade summary (last window) ---")
             print(summarize_trades(trades_last, args.timeframe))
 
+            # Денежное эквити за окно
             o_last = feat_last['o'].reindex(pos_exec_last.index).astype(float)
             ret_last = (o_last.shift(-1) / o_last - 1.0).dropna()
             pos_e_last = pos_exec_last.reindex(ret_last.index).fillna(0).astype(int)
@@ -1221,32 +862,16 @@ def main():
             print(f"Last-window PnL: profit={profit:.2f} (ROI {roi*100:.2f}%), "
                   f"final_value={final_value:.2f}, deposits={dep:.2f}, withdrawals={wd:.2f}")
 
-    # ===== OOT: калибруем пороги на 80%, тестим на 20% (фиксируем пороги из калибровки)
+    # ===== OOT: калибруем на 80%, тестим на 20% (фиксируем пороги из калибровки)
     cut = int(len(proba_s) * 0.8)
     proba_calib, proba_test = proba_s.iloc[:cut], proba_s.iloc[cut:]
     feat_calib, feat_test   = df_feat.iloc[:cut], df_feat.iloc[cut:]
 
-    if args.search == "bayes":
-        best_cal, stats_cal, *_ = search_thresholds_bayes(
-            proba_calib, feat_calib, args.timeframe,
-            turnover_cap=args.turnover_cap, max_dd_cap=args.max_dd_cap,
-            n_calls=args.bayes_calls,
-            fee_per_side=FEE_PER_SIDE, slippage_per_side=SLIPPAGE_PER_SIDE
-        )
-    elif args.search == "dynamic":
-        best_cal, stats_cal, *_ = search_thresholds_dynamic(
-            proba_calib, feat_calib, args.timeframe,
-            turnover_cap=args.turnover_cap, max_dd_cap=0.30,
-            use_dynamic_sizing=args.use_dynamic_sizing,
-            fee_per_side=FEE_PER_SIDE, slippage_per_side=SLIPPAGE_PER_SIDE
-        )
-    else:
-        best_cal, stats_cal, *_ = search_thresholds_grid(
-            proba_calib, feat_calib, args.timeframe,
-            turnover_cap=args.turnover_cap, max_dd_cap=args.max_dd_cap,
-            fee_per_side=FEE_PER_SIDE, slippage_per_side=SLIPPAGE_PER_SIDE
-        )
-
+    best_cal, stats_cal, *_ = search_thresholds(
+        proba_calib, feat_calib, args.timeframe,
+        turnover_cap=args.turnover_cap, max_dd_cap=args.max_dd_cap,
+        fee_per_side=FEE_PER_SIDE, slippage_per_side=SLIPPAGE_PER_SIDE
+    )
     if best_cal is not None:
         el, xl, es, xs, mh, cd = best_cal
         stats_oot = backtest_hysteresis_open_next(
