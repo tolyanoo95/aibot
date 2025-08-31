@@ -439,43 +439,47 @@ class LiveTrader:
             self.sl_cooldown_short = False
             print("INFO: Блокировка SHORT снята (proba > exit_short)")
             
-        # We can't act on a signal if we are already pending an action
-        if self.pending_exec is not None:
-            return
-
-        # --- Process Signal: сверяем "совет" модели с реальным состоянием ---
-        # СНАЧАЛА конвертируем "теоретический" сигнал в реальное действие
-        # 1. Модель советует войти, но мы уже в позиции -> исправляем на "ДЕРЖАТЬ"
-        if sig['action'] in ("ENTER_LONG", "ENTER_SHORT") and self.current_pos != 0:
-            sig['action'] = "HOLD_LONG" if self.current_pos == 1 else "HOLD_SHORT"
-            sig['next_state'] = self.current_pos
-        # 2. Модель советует выйти, но мы уже вне рынка -> исправляем на "БЕЗ ДЕЙСТВИЙ"
-        elif sig['action'] == "EXIT_TO_FLAT" and self.current_pos == 0:
-            sig['action'] = "STAY_FLAT"
-            sig['next_state'] = 0
-        # 3. Модель советует "ДЕРЖАТЬ ЛОНГ", но мы вне рынка -> это сигнал на ВХОД
-        elif sig['action'] == 'HOLD_LONG' and self.current_pos == 0:
-            sig['action'] = 'ENTER_LONG'
-        # 4. Модель советует "ДЕРЖАТЬ ШОРТ", но мы вне рынка -> это сигнал на ВХОД
-        elif sig['action'] == 'HOLD_SHORT' and self.current_pos == 0:
-            sig['action'] = 'ENTER_SHORT'
-
-        # --- Apply HTF Filter ---
+        # --- ШАГ 1: Применяем все фильтры к "теоретическому" сигналу ---
+        # 1.1 HTF Filter
         if self.use_htf_filter and trend_is_up is not None:
-            if sig['action'] == "ENTER_LONG" and not trend_is_up:
-                print(f"HTF filter blocks LONG signal (HTF trend is DOWN)")
-                sig['action'] = "STAY_FLAT"; sig['next_state'] = 0
-            elif sig['action'] == "ENTER_SHORT" and trend_is_up:
+            # Если HTF=UP, запрещаем любые шорты (вход и удержание)
+            if trend_is_up and sig['next_state'] == -1:
                 print(f"HTF filter blocks SHORT signal (HTF trend is UP)")
                 sig['action'] = "STAY_FLAT"; sig['next_state'] = 0
-
-        # --- Применяем новую блокировку после SL ---
+            # Если HTF=DOWN, запрещаем любые лонги
+            elif not trend_is_up and sig['next_state'] == 1:
+                print(f"HTF filter blocks LONG signal (HTF trend is DOWN)")
+                sig['action'] = "STAY_FLAT"; sig['next_state'] = 0
+        
+        # 1.2 SL Cooldown Filter
         if self.sl_cooldown_long and sig['action'] == "ENTER_LONG":
             print(f"SL Cooldown блокирует вход в LONG")
             sig['action'] = "STAY_FLAT"; sig['next_state'] = 0
         if self.sl_cooldown_short and sig['action'] == "ENTER_SHORT":
             print(f"SL Cooldown блокирует вход в SHORT")
             sig['action'] = "STAY_FLAT"; sig['next_state'] = 0
+
+        # We can't act on a signal if we are already pending an action
+        if self.pending_exec is not None:
+            return
+
+        # --- ШАГ 2: Сверяем отфильтрованный сигнал с РЕАЛЬНЫМ состоянием ---
+        if sig['next_state'] != self.current_pos and self.current_pos != 0:
+            print(f"INFO: Расхождение состояний. Модель -> {sig['next_state']}, Реальная -> {self.current_pos}. Принудительный выход.")
+            sig['action'] = 'EXIT_TO_FLAT'
+            sig['next_state'] = 0
+
+        # Конвертируем "теоретический" сигнал в реальное действие
+        if sig['action'] in ("ENTER_LONG", "ENTER_SHORT") and self.current_pos != 0:
+            sig['action'] = "HOLD_LONG" if self.current_pos == 1 else "HOLD_SHORT"
+            sig['next_state'] = self.current_pos
+        elif sig['action'] == "EXIT_TO_FLAT" and self.current_pos == 0:
+            sig['action'] = "STAY_FLAT"
+            sig['next_state'] = 0
+        elif sig['action'] == 'HOLD_LONG' and self.current_pos == 0:
+            sig['action'] = 'ENTER_LONG'
+        elif sig['action'] == 'HOLD_SHORT' and self.current_pos == 0:
+            sig['action'] = 'ENTER_SHORT'
 
         tf_delta = timeframe_to_timedelta(self.timeframe)
         decision_bar_open_ts = sig["bar_open_ts"]
