@@ -37,7 +37,7 @@ SLIPPAGE_PER_SIDE = 0.0001           # проскальзывание на ст�
 RANDOM_STATE = 42
 DEFAULT_TURNOVER_CAP = 0.05 #0.02         # макс. поворотов на бар
 DEFAULT_MAX_DD_CAP = 0.40            # макс. просадка для отбора порогов
-DEFAULT_LAST_DAYS = 0                # окно "последние N дней", 0=выключено
+DEFAULT_LAST_DAYS = 30                # окно "последние N дней", 0=выключено
 
 # ----------------------------- Utils -----------------------------
 def timeframe_to_minutes(tf: str) -> int:
@@ -106,10 +106,12 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     d = df.copy()
     d = d.rename(columns=str.lower)
 
-    d['ret1']  = d['c'].pct_change()
-    d['ret3']  = d['c'].pct_change(3)
-    d['ret5']  = d['c'].pct_change(5)
-    d['ret20'] = d['c'].pct_change(20)
+    d['vol20'] = d['c'].pct_change().rolling(20).std()
+    
+    d['ret1']  = d['c'].pct_change() / d['vol20']
+    d['ret3']  = d['c'].pct_change(3) / d['vol20']
+    d['ret5']  = d['c'].pct_change(5) / d['vol20']
+    d['ret20'] = d['c'].pct_change(20) / d['vol20']
 
     d['rsi'] = RSIIndicator(d['c'], window=14).rsi()
 
@@ -126,7 +128,6 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     rng = (bb.bollinger_hband() - bb.bollinger_lband()).replace(0, np.nan)
     d['bb_pos'] = (d['c'] - bb.bollinger_mavg()) / rng
 
-    d['vol20'] = d['ret1'].rolling(20).std()
     d = d.dropna()
     return d
 
@@ -165,9 +166,10 @@ def oof_predict_lgbm_purged(X: pd.DataFrame, y: pd.Series, n_splits=5,
                             purge=24, embargo=12, random_state=RANDOM_STATE) -> pd.Series:
     proba = pd.Series(index=X.index, dtype=float)
     params = dict(
-        n_estimators=4000, learning_rate=0.03, num_leaves=127,
+        n_estimators=2000, learning_rate=0.01, num_leaves=31,
         max_depth=-1, subsample=0.8, colsample_bytree=0.8,
-        reg_lambda=1.0, objective='binary', class_weight='balanced',
+        reg_alpha=0.1, reg_lambda=1.0, min_child_samples=20,
+        objective='binary', class_weight='balanced',
         force_col_wise=True, verbosity=-1, random_state=random_state
     )
     n = len(X)
@@ -894,9 +896,9 @@ def main():
 
     # === Save final model for live inference ===
     final_params = dict(
-        n_estimators=2000, learning_rate=0.03, num_leaves=63, max_depth=-1,
-        min_data_in_leaf=10, min_data_in_bin=1, min_gain_to_split=1e-8,
-        subsample=0.8, colsample_bytree=0.8, reg_lambda=1.0,
+        n_estimators=2000, learning_rate=0.01, num_leaves=31, max_depth=-1,
+        min_child_samples=20,
+        subsample=0.8, colsample_bytree=0.8, reg_alpha=0.1, reg_lambda=1.0,
         objective='binary', class_weight='balanced', force_col_wise=True,
         verbosity=-1, random_state=RANDOM_STATE
     )
@@ -906,6 +908,23 @@ def main():
           "feat_cols": list(X.columns),
           "smooth_span": args.smooth_span}, "final_model_lgbm.pkl")
     print("Saved: final_model_lgbm.pkl")
+
+    if args.plot and len(stats_oot['equity']):
+        plt.figure(figsize=(12, 6))
+        # OOT-эквити
+        stats_oot['equity'].plot(label='Strategy (OOT)')
+        # BH на OOT-периоде
+        bh_test = (feat_test['c'] / feat_test['c'].iloc[0])
+        bh_test.plot(label='Buy & Hold (OOT)', linestyle=':')
+        # OOF-эквити на калибровочном участке для сравнения
+        if not use_loose and stats_cal and len(stats_cal['equity']):
+             (stats_cal['equity'] * (1/stats_cal['equity'].iloc[0])).plot(label='Strategy (In-Sample/Calibration)', alpha=0.7)
+        plt.legend()
+        plt.title(f"OOT Equity Curve vs In-Sample | {args.symbol} {args.timeframe}")
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.show()
+
 
 if __name__ == "__main__":
     # macOS/libomp helper (если lightgbm ругается на libomp: brew install libomp)
